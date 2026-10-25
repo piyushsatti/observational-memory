@@ -14,7 +14,10 @@ append-only ledger, ~/.local/state/observational-memory/<harness>/<session>.json
 No harness lets a hook replace its compaction summary, so the notes are added after it: PreCompact
 catches the observer up, and the first hook that can add context after the compaction (SessionStart
 `compact` in Claude Code and Codex, the next postToolUse in Cursor) puts the rendered notes in.
-`recall-mcp` serves the `recall` tool, which returns the exact transcript lines behind a note's id.
+OpenCode 2 is the exception: its plugin (opencode/observational-memory.js) hands over the session's
+messages, which are mirrored to a JSONL transcript, and its compaction hook puts the notes into the
+compaction's own input. `recall-mcp` serves the `recall` tool, which returns the exact transcript
+lines behind a note's id; `recall <id>` answers it once (the OpenCode plugin's tool).
 
 Standard library only, run as `python3 -I`. Every hook exits at once when OBSERVATIONAL_MEMORY_CHILD is set: the
 observer's own model call sets it, so that call fires no observational-memory hooks.
@@ -38,7 +41,7 @@ from datetime import datetime
 from pathlib import Path
 
 VERSION = "2026.10.22"
-HARNESSES = ("claude", "codex", "cursor")
+HARNESSES = ("claude", "codex", "cursor", "opencode")
 RELEVANCE = ("low", "medium", "high", "critical")
 RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 MEMORY_ID = re.compile(r"^[a-f0-9]{12}$")
@@ -63,11 +66,15 @@ DEFAULTS = {
     "hook_log": True,  # one line per hook call in hooks.log, content-free
     # The headless command that answers the observer, reflector and dropper; the prompt goes on stdin.
     # None picks the default for the harness (Cursor: claude if installed, else codex).
-    "model_command": {"claude": None, "codex": None, "cursor": None},
+    "model_command": {"claude": None, "codex": None, "cursor": None, "opencode": None},
 }
 DEFAULT_COMMANDS = {
     "claude": ["claude", "-p", "--model", "{model}"],
     "codex": ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", "-"],
+    # OpenCode 2 reads the prompt from stdin when stdin is not a terminal. --standalone gives the call
+    # its own server, which inherits OBSERVATIONAL_MEMORY_CHILD, so the plugin there stays idle. No -m:
+    # the user's default OpenCode model answers (`model` names a Claude model OpenCode may not have).
+    "opencode": ["opencode", "run", "--standalone"],
 }
 
 # Text that is ours: never observed again when it shows up in a transcript.
@@ -338,13 +345,61 @@ def parse_cursor(obj: dict, lineno: int, cfg: dict, main: bool):
     return {"id": f"L{lineno}", "role": label, "ts": local_stamp(obj.get("timestamp")), "text": text}
 
 
-PARSERS = {"claude": parse_claude, "codex": parse_codex, "cursor": parse_cursor}
+def ms_stamp(ms) -> str | None:
+    """Epoch milliseconds (OpenCode's `time.created`) as local YYYY-MM-DD HH:MM."""
+    if not isinstance(ms, (int, float)) or isinstance(ms, bool):
+        return None
+    with contextlib.suppress(OverflowError, OSError, ValueError):
+        return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
+    return None
+
+
+def parse_opencode(obj: dict, lineno: int, cfg: dict, main: bool):
+    # One line per OpenCode 2 session message, as the plugin read it from ctx.session.context: user
+    # messages carry `text` (and `files`), assistant ones a `content` list of text, reasoning and tool
+    # parts. `idle`, `compaction` (OpenCode's own summary) and anything new carry nothing to observe.
+    kind = obj.get("type")
+    sid = str(obj.get("id") or f"L{lineno}")
+    ts = ms_stamp(obj["time"].get("created")) if isinstance(obj.get("time"), dict) else None
+    if kind == "user":
+        files = [f for f in obj.get("files") or [] if isinstance(f, dict)]
+        text = "\n".join([str(obj.get("text") or "")] + [f"[file {f.get('name') or f.get('uri') or ''}]" for f in files])
+        if not text.strip() or ours(text):
+            return None
+        return {"id": sid, "role": "User", "ts": ts, "text": text}
+    if kind != "assistant":
+        return None
+    parts = []
+    for p in obj.get("content") or []:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") == "text":
+            parts.append(str(p.get("text", "")))
+        elif p.get("type") == "tool":
+            state = p.get("state") if isinstance(p.get("state"), dict) else {}
+            parts.append(f"tool {p.get('name')} {clip(json.dumps(state.get('input'), ensure_ascii=False), cfg['tool_input_chars'])}")
+            out = state.get("content")
+            if isinstance(out, list):
+                out = "\n".join(str(c.get("text", "")) for c in out if isinstance(c, dict) and "text" in c)
+            elif state.get("error") is not None:
+                out = f"error: {state.get('error')}"
+            if out:
+                parts.append(f"result: {clip(out if isinstance(out, str) else json.dumps(out, ensure_ascii=False), cfg['tool_text_chars'])}")
+    text = "\n".join(x for x in parts if x)
+    if not text.strip() or ours(text):
+        return None
+    return {"id": sid, "role": "Assistant", "ts": ts, "text": text}
+
+
+PARSERS = {"claude": parse_claude, "codex": parse_codex, "cursor": parse_cursor, "opencode": parse_opencode}
 
 
 def line_id(harness: str, obj, lineno: int) -> str:
     """The id a line has whether or not it is a source entry, for recall."""
     if harness == "claude" and isinstance(obj, dict) and obj.get("uuid"):
         return str(obj["uuid"])
+    if harness == "opencode" and isinstance(obj, dict) and obj.get("id"):
+        return str(obj["id"])
     return f"L{lineno}"
 
 
@@ -401,6 +456,36 @@ def read_sources(harness: str, path: str | None, after: dict | None, main: bool 
             if e["id"] == after.get("id") and e["hash"] == after.get("hash"):
                 return every[i + 1 :]
     return every
+
+
+def opencode_transcript(session: str) -> Path:
+    """OpenCode 2 keeps sessions in SQLite and its context() drops what a compaction covered, so the
+    plugin hands over each session's messages and they are mirrored here, append-only, one per line."""
+    return root() / "opencode" / "transcripts" / f"{safe(session)}.jsonl"
+
+
+def sync_opencode(session: str, messages) -> str:
+    """Appends the messages not yet mirrored, in order, and returns the mirror's path. Stops at an
+    assistant message that is still streaming, so the mirror never holds a half-written turn and its
+    order stays the session's; the next sync picks it up. Locked, since every plugin instance sees
+    the same turn end."""
+    path = opencode_transcript(session)
+    with open_private(path) as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        have = set()
+        with contextlib.suppress(OSError):
+            for _, _, _, obj in iter_lines(str(path)):
+                if isinstance(obj, dict) and obj.get("id"):
+                    have.add(str(obj["id"]))
+        for m in messages if isinstance(messages, list) else []:
+            if not isinstance(m, dict) or not m.get("id") or str(m["id"]) in have:
+                continue
+            if m.get("type") == "assistant" and not (m.get("time") or {}).get("completed"):
+                break
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
+            have.add(str(m["id"]))
+        f.flush()
+    return str(path)
 
 
 # ---------------------------------------------------------------- the ledger
@@ -502,7 +587,7 @@ INSTRUCTIONS = f"""{NOTES_HEADER}, kept by the observational-memory observer and
 
 Treat these as past records. Where they are more specific than the summary above, they hold; when entries conflict, the most recent one is the latest known state, and a later message overrides any note. Work an observation marks as completed should not be redone unless the user asks to revisit it.
 
-When exact source context is needed for precision or traceability, call the `recall` tool (observational-memory MCP server) with the observation's or reflection's id. Do not use it as a broad search."""
+When exact source context is needed for precision or traceability, call the `recall` tool (observational-memory MCP server, or the OpenCode plugin's own tool) with the observation's or reflection's id. Do not use it as a broad search."""
 
 
 def pick_within(records: list[dict], line, budget: int) -> tuple[list[dict], int]:
@@ -850,16 +935,17 @@ def reflect(harness: str, session: str, force: bool = True) -> str:
         return reflect_locked(harness, session, cfg, force) if got else "busy"
 
 
-def spawn_observe(harness: str, session: str, transcript: str, stream: str = "main", force: bool = False) -> None:
-    """`observational-memory observe` detached, so the hook returns at once. OBSERVATIONAL_MEMORY_SYNC=1 runs it in this process (tests)."""
+def spawn_observe(harness: str, session: str, transcript: str, stream: str = "main", force: bool = False) -> subprocess.Popen | None:
+    """`observational-memory observe` detached, so the hook returns at once; the handle lets a caller
+    wait for it. OBSERVATIONAL_MEMORY_SYNC=1 runs it in this process (tests) and returns None."""
     if os.environ.get("OBSERVATIONAL_MEMORY_SYNC") == "1":
         observe(harness, session, transcript, stream, force)
-        return
+        return None
     cmd = [sys.executable, "-I", os.path.abspath(__file__), "observe", "--harness", harness, "--session", session, "--transcript", transcript, "--stream", stream]
     if force:
         cmd.append("--force")
     with open_private(root() / "observational-memory.log") as out:
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, cwd=root())
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, cwd=root())
 
 
 # ---------------------------------------------------------------- injection, status, view, mode
@@ -921,7 +1007,7 @@ def status_text(harness: str, session: str, transcript: str | None = None) -> st
     gauge = lambda n, of: f"{f'{min(n, of):,} / {of:,} tok':<24} {bar(n / of if of else 0)} {round(min(1, n / of if of else 0) * 100)}%"  # noqa: E731
     injected = next((e for e in reversed(entries) if e["type"] == "observational-memory.injected"), None)
     last_inj = (
-        f"{injected['at']} · {len(injected['data'].get('observationIds', []))} observations, {len(injected['data'].get('reflectionIds', []))} reflections ({injected['data'].get('tokens', 0):,} tok) after the summary"
+        f"{injected['at']} · {len(injected['data'].get('observationIds', []))} observations, {len(injected['data'].get('reflectionIds', []))} reflections ({injected['data'].get('tokens', 0):,} tok) {'into the compaction input' if injected['data'].get('event') == 'compacting' else 'after the summary'}"
         if injected
         else "none yet"
     )
@@ -1012,7 +1098,18 @@ EVENTS = {
     "userpromptsubmit": "prompt",
     "beforesubmitprompt": "prompt",
     "posttooluse": "post_tool_use",
+    "compacting": "compacting",  # OpenCode: the compaction hook, before the summary model call
 }
+
+# OpenCode is the one harness whose compaction input a plugin can extend: the notes go to the
+# summarizer as a system part, ahead of OpenCode's own summary prompt.
+OPENCODE_PREAMBLE = (
+    "Required addition to the summary format: after your last section, add a final section headed "
+    "`## observational-memory` and copy into it, verbatim, every line under `## Reflections` and "
+    "`## Observations` below, each with its bracketed 12-character id. Do not paraphrase these lines or "
+    "drop the ids: the `recall` tool needs an id to return its source. The block is observational-memory's "
+    "record of this session."
+)
 
 
 def noop(harness: str, event: str) -> dict | None:
@@ -1046,6 +1143,9 @@ def hook(harness: str, event_name: str, payload: dict) -> tuple[dict | None, str
     session = str(payload.get(first) or payload.get(second) or "unknown")
     transcript = payload.get("transcript_path")
     cfg = load_config()
+
+    if harness == "opencode":
+        return hook_opencode(event, session, payload, cfg)
 
     if event == "prompt":
         m = COMMAND_RE.match(str(payload.get("prompt") or ""))
@@ -1098,6 +1198,42 @@ def hook(harness: str, event_name: str, payload: dict) -> tuple[dict | None, str
         return (context_output(harness, event, text), "injected") if text else (noop(harness, event), "empty")
 
     return noop(harness, event), "unhandled"
+
+
+def hook_opencode(event: str, session: str, payload: dict, cfg: dict) -> tuple[dict, str]:
+    """The OpenCode plugin's two calls. Its payload carries the session's messages (ctx.session.context)
+    rather than a transcript path; they are mirrored first and the mirror is the transcript.
+
+    stop: a turn ended; observe, detached. A child session (a subagent's) goes to its parent's
+    ledger under stream agent:<child>, as SubagentStop does, and only with `agents both`.
+    compacting: catch up, wait for it like SessionStart does, and answer {"context": notes}, which the
+    plugin adds to the compaction's system prompt."""
+    if cfg["mode"] == "off" and not (event == "stop" and payload.get("parent_session_id")):
+        return {}, "off"
+    messages = payload.get("messages")
+    if event == "stop":
+        parent = payload.get("parent_session_id")
+        if parent:
+            if cfg["agents"] == "off":
+                return {}, "agents-off"
+            path = sync_opencode(session, messages)
+            spawn_observe("opencode", str(parent), path, stream=f"agent:{safe(session)}", force=True)
+            return {}, "spawned-agent"
+        path = sync_opencode(session, messages)
+        spawn_observe("opencode", session, path)
+        return {}, "spawned"
+    if event == "compacting":
+        path = sync_opencode(session, messages)
+        deadline = time.monotonic() + float(cfg["inject_wait_seconds"])
+        proc = spawn_observe("opencode", session, path, force=True)
+        if proc is not None:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        # It returns at once when a turn-end observer holds the lock; wait for that one instead.
+        wait_idle("opencode", session, max(0.0, deadline - time.monotonic()))
+        text = inject("opencode", session, event)
+        return ({"context": f"{OPENCODE_PREAMBLE}\n\n{text}"}, "injected") if text else ({}, "empty")
+    return {}, "unhandled"
 
 
 def run_hook(harness: str, event: str) -> int:
@@ -1304,6 +1440,8 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("words", nargs="*", help="[main|agents] both|off")
     sub.add_parser("statusline", help="a status segment from Claude Code's statusLine JSON on stdin")
     sub.add_parser("recall-mcp", help="MCP stdio server with the recall tool")
+    r = sub.add_parser("recall", help="the recall tool once, from a shell or the OpenCode plugin")
+    r.add_argument("id")
     args = p.parse_args(argv)
 
     if args.cmd == "hook":
@@ -1313,6 +1451,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "recall-mcp":
         return recall_mcp()
+    if args.cmd == "recall":
+        print(recall(args.id))
+        return 0
     if args.cmd == "statusline":
         raw = sys.stdin.read()
         print(statusline(json.loads(raw) if raw.strip() else {}))

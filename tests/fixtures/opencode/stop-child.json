@@ -1,0 +1,116 @@
+{
+  "session_id": "ses_child1",
+  "parent_session_id": "ses_opencode1",
+  "directory": "{cwd}",
+  "messages": [
+    {
+      "id": "msg_0001user",
+      "time": {
+        "created": 1792904438661
+      },
+      "text": "Split the parser in src/widget.py. The synthetic widget module needs its parser split into two files before release. The synthetic widget module needs its parser split into two files before release. The synthetic widget module needs its parser split into two files before release. The synthetic widget module needs its parser split into two files before release. ",
+      "files": [],
+      "type": "user"
+    },
+    {
+      "id": "msg_0002asst",
+      "time": {
+        "created": 1792904439661,
+        "streamed": 1792904440161,
+        "completed": 1792904440261
+      },
+      "type": "assistant",
+      "agent": "build",
+      "model": {
+        "id": "synthetic-model",
+        "providerID": "opencode",
+        "variant": "default"
+      },
+      "content": [
+        {
+          "type": "reasoning",
+          "text": "SECRET-REASONING",
+          "native": {
+            "reasoningField": "reasoning_content"
+          }
+        },
+        {
+          "type": "tool",
+          "id": "call_1",
+          "name": "shell",
+          "executed": false,
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "ls src"
+            },
+            "content": [
+              {
+                "type": "text",
+                "text": "widget.py The synthetic widget module needs its parser split into two files before release. The synthetic widget module needs its parser split into two files before release. The synthetic widget module needs its parser split into two files before release. The synthetic widget module needs its parser split into two files before release. "
+              }
+            ],
+            "metadata": {
+              "status": "completed",
+              "truncated": false,
+              "exit": 0
+            }
+          }
+        }
+      ],
+      "finish": "tool-calls",
+      "rawFinish": "tool-calls",
+      "cost": 0,
+      "tokens": {
+        "input": 10,
+        "output": 10,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    },
+    {
+      "id": "msg_0003asst",
+      "time": {
+        "created": 1792904440661,
+        "streamed": 1792904441161,
+        "completed": 1792904441261
+      },
+      "type": "assistant",
+      "agent": "build",
+      "model": {
+        "id": "synthetic-model",
+        "providerID": "opencode",
+        "variant": "default"
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "Done: the parser now lives in src/widget_parse.py. The synthetic widget module needs its parser split into two files before release. The synthetic widget module needs its parser split into two files before release. The synthetic widget module needs its parser split into two files before release. The synthetic widget module needs its parser split into two files before release. "
+        }
+      ],
+      "finish": "stop",
+      "rawFinish": "stop",
+      "cost": 0,
+      "tokens": {
+        "input": 10,
+        "output": 10,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    },
+    {
+      "id": "msg_0004idle",
+      "time": {
+        "created": 1792904441661
+      },
+      "type": "idle",
+      "outcome": "succeeded"
+    }
+  ]
+}

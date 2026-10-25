@@ -90,7 +90,7 @@ def cursor_lines(start: int, count: int) -> list[dict]:
 
 
 BUILDERS = {"claude": claude_lines, "codex": codex_lines, "cursor": cursor_lines}
-SESSIONS = {"claude": "s-claude-1", "codex": "s-codex-1", "cursor": "c-cursor-1"}
+SESSIONS = {"claude": "s-claude-1", "codex": "s-codex-1", "cursor": "c-cursor-1", "opencode": "ses_opencode1"}
 
 
 def write_lines(path: Path, lines: list[dict], append: bool = False) -> None:
@@ -135,7 +135,7 @@ class OmCase(unittest.TestCase):
                 "reflect_after_tokens": 200,
                 "pool_target_tokens": 10,
                 "inject_wait_seconds": 0,
-                "model_command": {"claude": fake, "codex": fake, "cursor": fake},
+                "model_command": {"claude": fake, "codex": fake, "cursor": fake, "opencode": fake},
             }
         )
         self.work = self.home / "work"
@@ -623,6 +623,122 @@ class TestRendering(OmCase):
         cfg["model_command"] = {"claude": None, "codex": None, "cursor": None}
         self.assertEqual(mem.model_command(cfg, "claude"), ["claude", "-p", "--model", "sonnet"])
         self.assertEqual(mem.model_command(cfg, "codex")[:2], ["codex", "exec"])
+        cfg["model_command"]["opencode"] = None
+        self.assertEqual(mem.model_command(cfg, "opencode"), ["opencode", "run", "--standalone"])
+
+
+# ---------------------------------------------------------------- OpenCode: the plugin's payloads
+
+
+class TestOpenCode(OmCase):
+    """The plugin sends the session's messages (ctx.session.context) on stdin; fixtures are in the shape
+    OpenCode 2.1.4 returned in a real session, with synthetic text."""
+
+    SESSION = "ses_opencode1"
+
+    def payload(self, name: str) -> dict:
+        return json.loads(fixture("opencode", name, cwd=self.work))
+
+    def mirror(self) -> Path:
+        return mem.opencode_transcript(self.SESSION)
+
+    def test_sync_mirrors_messages_once_in_order_and_stops_at_a_streaming_reply(self):
+        path = mem.sync_opencode(self.SESSION, self.payload("compacting")["messages"])
+        ids = [json.loads(x)["id"] for x in Path(path).read_text().splitlines()]
+        self.assertEqual(ids, ["msg_0001user", "msg_0002asst", "msg_0003asst", "msg_0004idle", "msg_0007user"])  # msg_0008asst still streaming
+        # After the compaction, context() starts at OpenCode's summary: only what is new is appended.
+        mem.sync_opencode(self.SESSION, self.payload("stop-after-compaction")["messages"])
+        ids = [json.loads(x)["id"] for x in Path(path).read_text().splitlines()]
+        self.assertEqual(ids[5:], ["msg_0005comp", "msg_0006idle", "msg_0008asst", "msg_0009idle"])
+        self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+
+    def test_parser_reads_user_text_and_tools_and_skips_reasoning_idle_and_the_native_summary(self):
+        mem.sync_opencode(self.SESSION, self.payload("stop")["messages"] + self.payload("stop-after-compaction")["messages"])
+        sources = mem.read_sources("opencode", str(self.mirror()), None)
+        self.assertEqual([s["id"] for s in sources], ["msg_0001user", "msg_0002asst", "msg_0003asst", "msg_0007user", "msg_0008asst"])
+        self.assertEqual([s["role"] for s in sources[:3]], ["User", "Assistant", "Assistant"])
+        text = "\n".join(s["text"] for s in sources)
+        self.assertIn('tool shell {"command": "ls src"}', text)
+        self.assertIn("result: widget.py", text)
+        self.assertNotIn("SECRET-REASONING", text)
+        self.assertNotIn("NATIVE-SUMMARY", text)
+        self.assertRegex(sources[0]["ts"], r"^\d{4}-\d\d-\d\d \d\d:\d\d$")
+
+    def test_stop_mirrors_and_observes(self):
+        out, ledger = self.hook("opencode", "stop")
+        self.assertEqual(out, "{}")
+        recorded = self.entries("opencode", "observational-memory.observations.recorded")
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]["transcript_path"], str(self.mirror()))
+        self.assertTrue(all(s.startswith("msg_") for o in recorded[0]["data"]["observations"] for s in o["sourceEntryIds"]))
+        self.assertTrue(ledger.exists())
+
+    def test_compacting_catches_up_and_answers_the_notes_for_the_compaction(self):
+        mem.save_config({"observe_after_tokens": 100_000})  # the turn-end observer stays below
+        self.hook("opencode", "stop")
+        self.assertEqual(self.entries("opencode", "observational-memory.observations.recorded"), [])
+        out, _ = self.hook("opencode", "compacting")
+        context = json.loads(out)["context"]
+        self.assertTrue(context.startswith(mem.OPENCODE_PREAMBLE))
+        self.assertIn(mem.NOTES_HEADER, context)
+        recorded = self.entries("opencode", "observational-memory.observations.recorded")
+        self.assertEqual(len(recorded), 1)  # forced catch-up below the threshold
+        for o in recorded[0]["data"]["observations"]:
+            self.assertIn(f"[{o['id']}]", context)
+        injected = self.entries("opencode", "observational-memory.injected")
+        self.assertEqual(injected[-1]["data"]["event"], "compacting")
+        self.assertIn("into the compaction input", mem.status_text("opencode", self.SESSION))
+
+    def test_compacting_with_nothing_to_add_prints_the_noop(self):
+        os.environ["OBSERVATIONAL_MEMORY_FAKE"] = "empty"
+        out, _ = self.hook("opencode", "compacting")
+        self.assertEqual(out, "{}")
+        self.assertEqual(self.entries("opencode", "observational-memory.injected"), [])
+
+    def test_off_mirrors_and_observes_nothing(self):
+        mem.save_config({"mode": "off"})
+        for event in ("stop", "compacting"):
+            self.assertEqual(self.hook("opencode", event)[0], "{}")
+        self.assertFalse(self.mirror().exists())
+        self.assertEqual(self.calls(), [])
+
+    def test_child_session_goes_to_the_parent_ledger_only_with_agents_both(self):
+        self.assertEqual(self.hook("opencode", "stop", fixture_event="stop-child")[0], "{}")
+        self.assertEqual(self.calls(), [])
+        mem.save_config({"agents": "both"})
+        self.hook("opencode", "stop", fixture_event="stop-child")
+        recorded = self.entries("opencode", "observational-memory.observations.recorded")
+        self.assertEqual({e["stream"] for e in recorded}, {"agent:ses_child1"})
+        self.assertFalse(mem.ledger_path("opencode", "ses_child1").exists())
+
+    def test_recursion_guard(self):
+        for event in ("stop", "compacting"):
+            out, ledger = self.hook("opencode", event, env={"OBSERVATIONAL_MEMORY_CHILD": "1"})
+            self.assertEqual(out, "{}")
+            self.assertFalse(ledger.exists())
+        self.assertFalse(self.mirror().exists())
+        self.assertEqual(self.calls(), [])
+        self.assertTrue(all(x.endswith("child-skip") for x in (mem.root() / "hooks.log").read_text().splitlines()))
+
+    def test_recall_returns_the_mirrored_message_and_the_cli_prints_it(self):
+        self.hook("opencode", "stop")
+        o = self.entries("opencode", "observational-memory.observations.recorded")[0]["data"]["observations"][0]
+        lines = self.mirror().read_text().splitlines()
+        exact = next(x for x in lines if json.loads(x)["id"] == o["sourceEntryIds"][0])
+        self.assertIn(exact, mem.recall(o["id"]).splitlines())
+        done = subprocess.run([sys.executable, "-I", str(SCRIPT), "recall", o["id"]], capture_output=True, text=True, env=dict(os.environ), timeout=30)
+        self.assertIn(exact, done.stdout.splitlines())
+
+    def test_plugin_is_a_v2_default_export_and_calls_the_handled_events(self):
+        js = (HERE.parent / "opencode" / "observational-memory.js").read_text()
+        self.assertIn('id: "observational-memory"', js)
+        self.assertIn("export default {", js)
+        self.assertIn("process.env.OBSERVATIONAL_MEMORY_CHILD", js)
+        for call in ('["hook", "opencode", "stop"]', '["hook", "opencode", "compacting"]', '["recall", '):
+            self.assertIn(call, js)
+        self.assertIn('ctx.session.hook("compaction"', js)
+        manifest = json.loads((HERE.parent / "install.json").read_text())
+        self.assertIn({"src": "opencode/observational-memory.js", "dest": "~/.config/opencode/plugins/observational-memory.js", "mode": "0644"}, manifest["files"])
 
 
 if __name__ == "__main__":

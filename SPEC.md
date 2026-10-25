@@ -13,6 +13,7 @@ The observer reads **source entries**. These are the person's and the agent's me
 | Claude Code | JSONL at `transcript_path` | the line's `uuid` |
 | Codex | rollout JSONL; only `response_item` records (message, function_call, function_call_output, custom tool calls) | `L<line number>` |
 | Cursor | JSONL in `role` / `message.content` form | `L<line number>` |
+| OpenCode 2 | `~/.local/state/observational-memory/opencode/transcripts/<session>.jsonl`: a mirror with one OpenCode message per line, as `ctx.session.context` returns it, appended by the hook from the plugin's payload (OpenCode keeps sessions in SQLite, and `context` drops what a compaction covered); `user` and `assistant` messages only, so `idle` and OpenCode's own `compaction` summary are skipped | the message's `id` (`msg_…`) |
 
 An entry's size is estimated as characters / 4 tokens. A tool's input is cut to 300 characters and its result to 600 (om.tsx), because the model's own words carry the decisions.
 
@@ -91,7 +92,7 @@ Upstream's `compactAfterTokens` (81,000) and `observationsPoolMaxTokens` (20,000
 
 ### Recursion guard
 
-The observer, reflector and dropper call a headless CLI with `OBSERVATIONAL_MEMORY_CHILD=1` in its environment, from the state folder as working directory. Every `observational-memory hook` call exits at once when `OBSERVATIONAL_MEMORY_CHILD` is set. It prints only the harness's no-op answer and logs `child-skip`.
+The observer, reflector and dropper call a headless CLI with `OBSERVATIONAL_MEMORY_CHILD=1` in its environment, from the state folder as working directory. Every `observational-memory hook` call exits at once when `OBSERVATIONAL_MEMORY_CHILD` is set. It prints only the harness's no-op answer and logs `child-skip`. The OpenCode plugin checks the variable first: under it, `setup` registers nothing, so the observer's own `opencode run --standalone` server never calls the hook at all.
 
 ### State and logs
 
@@ -101,12 +102,12 @@ Everything lives under `~/.local/state/observational-memory/`: `config.json`, th
 
 ### Everywhere
 
-- **The notes are added after the harness's own summary, not in its place.** No harness lets a hook replace the compaction summary. Upstream's compaction is model-free and the notes *are* the summary; here the harness still runs its summarizer, and observational-memory's notes follow it. om.tsx's `observational-memory` mode (notes plus the newest messages, no summary) is gone, so the modes are `both` and `off`.
+- **The notes are added after the harness's own summary, not in its place.** No hook in Claude Code, Codex or Cursor can replace the compaction summary. OpenCode 2's `compaction` hook could, by setting `result`; this port keeps OpenCode's summary as well and puts the notes into its input, where the summarizer is told to copy them verbatim (see Per harness). That copy is only as faithful as the summary model. Upstream's compaction is model-free and the notes *are* the summary; here the harness still runs its summarizer, and observational-memory's notes follow it. om.tsx's `observational-memory` mode (notes plus the newest messages, no summary) is gone, so the modes are `both` and `off`.
 - **No proactive compaction.** Upstream calls `ctx.compact()` once `compactAfterTokens` of source has built up. Hooks cannot start a compaction, so the harness's own trigger decides.
 - **No normal versus full fold.** Upstream applies reflections and drops at compaction only once the visible pool reaches `observationsPoolMaxTokens`, to keep the summary stable. Here every injection renders the full fold, because the summary is not ours to keep stable.
 - **The compaction path is not instant.** Upstream's compaction hook never waits on the observer. Here PreCompact starts a catch-up, and SessionStart waits up to `inject_wait_seconds` for it, so the notes reach the compaction point.
 - **The model replies with JSON, not tool calls.** A headless CLI gives text back, so the prompts are upstream's three, condensed, asking for one JSON object. Upstream's multi-call "progress receipt" loop is gone: one call per chunk.
-- **Model choice.** The command is configurable per harness. The defaults are `claude -p --model <model>` for Claude Code, `codex exec --skip-git-repo-check --sandbox read-only -` for Codex, and for Cursor whichever of those is installed. `{model}` (default `sonnet`) is substituted. Upstream uses the session's model API in-process.
+- **Model choice.** The command is configurable per harness. The defaults are `claude -p --model <model>` for Claude Code, `codex exec --skip-git-repo-check --sandbox read-only -` for Codex, for Cursor whichever of those is installed, and `opencode run --standalone` for OpenCode (no `{model}`: `sonnet` is not an OpenCode model name, so OpenCode's default model answers unless the command adds `-m`). `{model}` (default `sonnet`) is substituted. Upstream uses the session's model API in-process.
 - **Branches.** Upstream's ledger is branch-local in Pi's session tree. These harnesses have linear transcripts, so it is one ledger per session.
 - **Recall searches every observational-memory ledger**, not only the current branch. An MCP server is not told which session called it, and ids are content hashes, so collisions are not a practical concern.
 - **`/observational-memory:view`** prints the notes but does not copy them to the clipboard. `/observational-memory:status` shows the observer, reflector and pool gauges and the last injection, but not upstream's visible-versus-full drift counts.
@@ -121,13 +122,14 @@ Everything lives under `~/.local/state/observational-memory/`: `config.json`, th
 
 ### Per harness
 
-| | Claude Code | Codex | Cursor |
-|---|---|---|---|
-| Turn end | `Stop` (`async: true`) starts a detached observer | `Stop` starts a detached observer | `stop` starts a detached observer |
-| Before compaction | `PreCompact` catch-up | `PreCompact` catch-up | `preCompact` catch-up, and a pending-inject flag is set |
-| After compaction | `SessionStart` matcher `compact`, `additionalContext` | the same | **No post-compaction hook.** The notes go in on the next `postToolUse` (`additional_context`), once. A turn with no tool call gets none until one happens. `sessionStart` also injects if the flag is still set. Untested. |
-| Commands | `UserPromptSubmit` → `{"decision":"block","reason":…}` | the same hook is installed, but Codex has no plugin commands; the skill tells the agent to run `observational-memory status --harness codex` | `beforeSubmitPrompt` → `{"continue":false,"user_message":…}`; the `/observational-memory:` spelling Cursor sends is untested |
-| Subagents | `SubagentStop`: `agent_id`, `agent_transcript_path` | `SubagentStop`, same field names assumed | `subagentStop`, field names guessed (`subagent_id` or `agent_id`, `agent_transcript_path`) |
-| Transcript | documented JSONL | rollout JSONL, format unstable | undocumented JSONL |
-| Statusline | `observational-memory statusline` segment | none | none |
-| Model call | `claude -p` | `codex exec` | `claude -p` or `codex exec`, whichever exists |
+| | Claude Code | Codex | Cursor | OpenCode 2 |
+|---|---|---|---|---|
+| Turn end | `Stop` (`async: true`) starts a detached observer | `Stop` starts a detached observer | `stop` starts a detached observer | the plugin sees `session.execution.succeeded` (or `session.idle`) on `ctx.event.subscribe`, and `hook opencode stop` gets the session's messages, mirrors them and starts a detached observer |
+| Before compaction | `PreCompact` catch-up | `PreCompact` catch-up | `preCompact` catch-up, and a pending-inject flag is set | the session `compaction` hook, before the summary model call: `hook opencode compacting` mirrors, starts the catch-up and waits up to `inject_wait_seconds` for it |
+| After compaction | `SessionStart` matcher `compact`, `additionalContext` | the same | **No post-compaction hook.** The notes go in on the next `postToolUse` (`additional_context`), once. A turn with no tool call gets none until one happens. `sessionStart` also injects if the flag is still set. Untested. | **Nothing after: the notes go into the compaction.** The hook answers `{"context": notes}`; the plugin pushes it onto the summarizer's system prompt with an instruction to copy the notes verbatim, ids included, into a final `## observational-memory` section, so OpenCode's own summary carries them |
+| Commands | `UserPromptSubmit` → `{"decision":"block","reason":…}` | the same hook is installed, but Codex has no plugin commands; the skill tells the agent to run `observational-memory status --harness codex` | `beforeSubmitPrompt` → `{"continue":false,"user_message":…}`; the `/observational-memory:` spelling Cursor sends is untested | none; the skill names `observational-memory status --harness opencode` |
+| Subagents | `SubagentStop`: `agent_id`, `agent_transcript_path` | `SubagentStop`, same field names assumed | `subagentStop`, field names guessed (`subagent_id` or `agent_id`, `agent_transcript_path`) | a child session (`parentID` from `ctx.session.get`, field name assumed) goes to the parent's ledger as `agent:<child session>` with `agents both`; untested |
+| Transcript | documented JSONL | rollout JSONL, format unstable | undocumented JSONL | the plugin's mirror of `ctx.session.context`, in the shape OpenCode 2.1.4 returned |
+| Statusline | `observational-memory statusline` segment | none | none | none |
+| Recall | MCP server | MCP server | MCP server | the plugin's own `recall` tool (`observational-memory recall <id>`); no MCP entry needed |
+| Model call | `claude -p` | `codex exec` | `claude -p` or `codex exec`, whichever exists | `opencode run --standalone`, prompt on stdin, OpenCode's default model; its private server inherits `OBSERVATIONAL_MEMORY_CHILD` and the plugin registers nothing there |
