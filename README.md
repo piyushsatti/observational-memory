@@ -21,7 +21,7 @@ It is a port of [pi-observational-memory](https://github.com/elpapi42/pi-observa
 | Codex | Verified on Codex 0.163.0 (V4): Stop observer; PreCompact catch-up; notes after the compaction through SessionStart `compact`; `recall`; the skill | The plugin's hooks run only after you trust them in `/hooks`. There are no commands: the TUI rejects `/observational-memory:…`, and Codex lists `commands/` as skills, which run `observational-memory status --harness codex` and the like. The rollout format is unstable, so parsing may break on a Codex update | Statusline; slash commands; SubagentStop untested |
 | Cursor | stop observer; preCompact catch-up; `/observational-memory:` commands through beforeSubmitPrompt; `recall`; the skill | No post-compaction hook: the notes go in on the next postToolUse, once, so a turn without a tool call gets none (untested); the transcript format is undocumented | Statusline; a reliable post-compaction injection point |
 
-Codex has run it end to end (V3 and V4). Claude Code and Cursor have not run it inside the harness yet. See [VERIFIED.md](VERIFIED.md).
+Claude Code and Codex have run it end to end (V3 and V4). Cursor has not run it inside the harness yet. See [VERIFIED.md](VERIFIED.md).
 
 ## Settings
 

@@ -7,8 +7,8 @@ One row per run, on the [verification ladder](https://github.com/piyushsatti/wor
 | V0 lint | pass, 2026-10-22: `python3 scripts/lint_plugins.py` → 5 plugins, 0 errors, 0 warnings (catalogs included) | same run | same run |
 | V1 native validator | pass, 2026-10-22, Claude Code 2.1.307: `claude plugin validate` | no validator found; lint checks the documented fields | no validator found; lint checks the documented fields |
 | V2 script tests | pass, 2026-10-22, Python 3.15.0: 36 tests OK | pass, same run | pass, same run |
-| V3 loads without install | not run | pass, 2026-10-25, Codex 0.163.0: installed from a local marketplace in a throwaway `HOME`/`CODEX_HOME`; the five hooks, the `observational-memory` MCP server and the skill load ([below](#codex-v3-and-v4-2026-10-25)) | not run |
-| V4 runtime behaviour | not run | pass, 2026-10-25, Codex 0.163.0: Stop observer writes the ledger, PreCompact catch-up, SessionStart `compact` adds the notes after the compaction, `recall` over MCP; `/observational-memory:` commands do not work ([below](#codex-v3-and-v4-2026-10-25)) | not run |
+| V3 loads without install | pass, 2026-10-25, Claude Code 2.1.307: `claude -p --plugin-dir` loads the five hooks, the `observational-memory` MCP server and the commands ([below](#claude-code-v3-and-v4-2026-10-25)) | pass, 2026-10-25, Codex 0.163.0: installed from a local marketplace in a throwaway `HOME`/`CODEX_HOME`; the five hooks, the `observational-memory` MCP server and the skill load ([below](#codex-v3-and-v4-2026-10-25)) | not run |
+| V4 runtime behaviour | pass, 2026-10-25, Claude Code 2.1.307: Stop observer writes the ledger, PreCompact catch-up, SessionStart `compact` adds the notes after the compaction, `recall` over MCP, `/om status` ([below](#claude-code-v3-and-v4-2026-10-25)) | pass, 2026-10-25, Codex 0.163.0: Stop observer writes the ledger, PreCompact catch-up, SessionStart `compact` adds the notes after the compaction, `recall` over MCP; `/observational-memory:` commands do not work ([below](#codex-v3-and-v4-2026-10-25)) | not run |
 | V5 in use | not run | not run | not run |
 
 ## V2, 2026-10-22
@@ -27,6 +27,18 @@ One row per run, on the [verification ladder](https://github.com/piyushsatti/wor
 - owner-only folders and files, and a refused symlinked ledger.
 
 V2 shows the script handles the documented and assumed input shapes. It does not show that any harness sends those shapes.
+
+## Claude Code V3 and V4, 2026-10-25
+
+Claude Code 2.1.307, session model and observer model `haiku`, `observe_after_tokens` set to 300 in `config.json`. One session, run as `claude -p --plugin-dir <repo> --output-format json`, then `--resume <id>` four more times.
+
+1. Turn 1 stated two facts. `hooks.log`: `UserPromptSubmit pass`, `Stop spawned`; the observer logged `below` (one short turn is under 300 tokens).
+2. Turn 2 read a file with the Read tool and stated a decision. `Stop spawned`, then the observer logged `recorded`: one `observations.recorded` entry with five observations (the decision at `critical`), 1,049 source tokens.
+3. Turn 3 was `/compact`. `hooks.log`: `PreCompact catch-up`, `SubagentStop agents-off` (the compaction's own agent), `SessionStart injected`. The transcript holds a `hook_additional_context` attachment starting with the notes header, after the compact boundary.
+4. Turn 4 allowed only the `recall` tool and asked for the database decision. The model called `recall` with id `81bda680b32a` and quoted the observation.
+5. Turn 5 was `/om status`. UserPromptSubmit blocked the prompt and returned the status panel (5 observations, last injection 471 tokens) with no model turn.
+
+Not run: SubagentStop with `agents both`, the reflector and the dropper, automatic compaction.
 
 ## Codex V3 and V4, 2026-10-25
 
