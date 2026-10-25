@@ -65,17 +65,21 @@ DEFAULTS = {
     "tool_input_chars": 300,
     "hook_log": True,  # one line per hook call in hooks.log, content-free
     # The headless command that answers the observer, reflector and dropper; the prompt goes on stdin.
-    # None picks the default for the harness (Cursor: claude if installed, else codex).
+    # None picks the default for the harness (Cursor and OpenCode: claude if installed, else codex; OpenCode last).
     "model_command": {"claude": None, "codex": None, "cursor": None, "opencode": None},
 }
 DEFAULT_COMMANDS = {
-    "claude": ["claude", "-p", "--model", "{model}"],
+    "claude": ["claude", "-p", "--model", "{model}", "--tools", ""],  # no tools: the transcript it reads is untrusted text
     "codex": ["codex", "exec", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "-"],  # --ephemeral: no rollout in the user's session list
     # OpenCode 2 reads the prompt from stdin when stdin is not a terminal. --standalone gives the call
     # its own server, which inherits OBSERVATIONAL_MEMORY_CHILD, so the plugin there stays idle. No -m:
     # the user's default OpenCode model answers (`model` names a Claude model OpenCode may not have).
+    # Every tool is denied through CHILD_ENV. Only the fallback when neither claude nor codex is installed.
     "opencode": ["opencode", "run", "--standalone"],
 }
+
+# Extra environment for a model command, by its program.
+CHILD_ENV = {"opencode": {"OPENCODE_CONFIG_CONTENT": json.dumps({"permission": {"*": "deny"}})}}
 
 # Text that is ours: never observed again when it shows up in a transcript.
 NOTES_HEADER = "observational-memory: condensed memories from earlier in this session"
@@ -644,11 +648,13 @@ class ModelError(Exception):
 def model_command(cfg: dict, harness: str) -> list[str]:
     cmd = (cfg.get("model_command") or {}).get(harness)
     if not cmd:
-        if harness == "cursor":
-            # Cursor has no headless CLI here: whichever of the other two is installed.
-            pick = "claude" if shutil.which("claude") else "codex" if shutil.which("codex") else None
+        if harness in ("cursor", "opencode"):
+            # Cursor has no headless CLI here, and OpenCode's default model may be a rate-limited free one:
+            # whichever of claude and codex is installed, then OpenCode itself.
+            last = ("opencode",) if harness == "opencode" else ()
+            pick = next((c for c in ("claude", "codex", *last) if shutil.which(c)), None)
             if pick is None:
-                raise ModelError("no model command: neither claude nor codex is on PATH; set model_command.cursor")
+                raise ModelError(f"no model command: neither claude nor codex is on PATH; set model_command.{harness}")
             cmd = DEFAULT_COMMANDS[pick]
         else:
             cmd = DEFAULT_COMMANDS[harness]
@@ -660,7 +666,7 @@ def call_model(cfg: dict, harness: str, prompt: str) -> str:
     child session's own hooks see it and do nothing. It runs from the state folder, so no project's
     instructions or settings reach it."""
     cmd = model_command(cfg, harness)
-    env = {**os.environ, "OBSERVATIONAL_MEMORY_CHILD": "1"}
+    env = {**os.environ, **CHILD_ENV.get(Path(cmd[0]).name, {}), "OBSERVATIONAL_MEMORY_CHILD": "1"}
     private_dir(root())
     try:
         done = subprocess.run(cmd, input=prompt, capture_output=True, text=True, env=env, cwd=root(), timeout=float(cfg["model_timeout_seconds"]))

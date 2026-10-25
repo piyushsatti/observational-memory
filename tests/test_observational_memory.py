@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -656,11 +657,15 @@ class TestRendering(OmCase):
     def test_model_command_defaults(self):
         cfg = mem.load_config()
         cfg["model_command"] = {"claude": None, "codex": None, "cursor": None}
-        self.assertEqual(mem.model_command(cfg, "claude"), ["claude", "-p", "--model", "sonnet"])
+        self.assertEqual(mem.model_command(cfg, "claude"), ["claude", "-p", "--model", "sonnet", "--tools", ""])
         self.assertEqual(mem.model_command(cfg, "codex")[:2], ["codex", "exec"])
         self.assertIn("--ephemeral", mem.model_command(cfg, "codex"))  # observer calls stay out of `codex resume`
         cfg["model_command"]["opencode"] = None
-        self.assertEqual(mem.model_command(cfg, "opencode"), ["opencode", "run", "--standalone"])
+        for installed, first in (({"claude", "codex", "opencode"}, "claude"), ({"codex", "opencode"}, "codex"), ({"opencode"}, "opencode")):
+            with mock.patch.object(mem.shutil, "which", lambda c, installed=installed: f"/bin/{c}" if c in installed else None):
+                self.assertEqual(mem.model_command(cfg, "opencode")[0], first)
+        self.assertEqual(mem.DEFAULT_COMMANDS["opencode"], ["opencode", "run", "--standalone"])
+        self.assertEqual(json.loads(mem.CHILD_ENV["opencode"]["OPENCODE_CONFIG_CONTENT"]), {"permission": {"*": "deny"}})
 
 
 # ---------------------------------------------------------------- OpenCode: the plugin's payloads
