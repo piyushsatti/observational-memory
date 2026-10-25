@@ -201,6 +201,30 @@ class TestParsers(OmCase):
             self.assertNotIn(hidden, text)
         self.assertIn("tool shell", text)
 
+    def test_codex_0_163_rollout(self):
+        # Trimmed from a real Codex CLI 0.163.0 run: developer and environment messages, reasoning,
+        # the compacted record and the injected notes are not source entries; custom_tool_call_output
+        # carries a list of input_text items, read as their text.
+        path = str(FIXTURES / "codex" / "rollout-0.163.0.jsonl")
+        sources = mem.read_sources("codex", path, None)
+        self.assertEqual([s["id"] for s in sources], ["L7", "L8", "L10", "L11", "L12", "L14"])
+        self.assertEqual([s["role"] for s in sources], ["User", "Assistant", "Assistant", "Assistant", "Tool result", "Assistant"])
+        self.assertIn("pet tortoise", sources[0]["text"])
+        self.assertTrue(sources[3]["text"].startswith("tool exec "))
+        result = sources[4]["text"]
+        self.assertIn("Script completed", result)
+        self.assertIn("tortoise-ready", result)
+        self.assertNotIn("input_text", result)
+        text = "\n".join(mem.render_source(s) for s in sources)
+        for hidden in ("SECRET-REASONING", "skills_instructions", "environment_context", mem.NOTES_HEADER):
+            self.assertNotIn(hidden, text)
+
+    def test_codex_tool_output_shapes(self):
+        self.assertEqual(mem.codex_output_text("plain"), "plain")
+        self.assertEqual(mem.codex_output_text([{"type": "input_text", "text": "a"}, {"type": "input_image", "image_url": "x"}]), "a\n[input_image]")
+        self.assertEqual(mem.codex_output_text({"content": "c", "success": True}), "c")
+        self.assertEqual(mem.codex_output_text({"other": 1}), '{"other": 1}')
+
     def test_cursor_parser_reads_role_message_content(self):
         sources = mem.read_sources("cursor", str(self.transcript("cursor", 3)), None)
         self.assertEqual([(s["id"], s["role"]) for s in sources], [("L1", "User"), ("L2", "Assistant"), ("L3", "User")])
@@ -456,6 +480,14 @@ class TestCommands(OmCase):
                 out, _ = self.hook(harness, event, transcript=path, prompt="/observational-memory:view")
                 self.assertIn("## Observations", out)
 
+    def test_command_files_tell_codex_what_to_run(self):
+        # Codex 0.163 turns commands/*.md into skills (`observational-memory:source-command-<name>`) and its
+        # TUI rejects `/observational-memory:<name>` as an unknown command, so the body names the shell command.
+        for f in sorted((HERE.parent / "commands").glob("*.md")):
+            body = f.read_text()
+            self.assertIn("Codex lists this command as a skill", body, f.name)
+            self.assertIn('"$HOME/.local/bin/observational-memory" ' + ("mode" if f.stem in ("on", "off", "mode") else f.stem), body, f.name)
+
     def test_other_prompts_pass_through(self):
         self.assertEqual(self.hook("claude", "UserPromptSubmit", prompt="/omelette please")[0], "")
         self.assertEqual(self.hook("codex", "UserPromptSubmit", prompt="tell me about observational-memory")[0], "{}")
@@ -546,6 +578,9 @@ class TestRecall(OmCase):
         self.assertEqual(replies[0]["result"]["serverInfo"]["name"], "observational-memory")
         self.assertEqual(replies[0]["result"]["protocolVersion"], "2025-06-18")
         self.assertEqual([t["name"] for t in replies[1]["result"]["tools"]], ["recall"])
+        # Codex refuses an MCP call under `codex exec` (approval policy never) unless the tool is read-only.
+        self.assertTrue(replies[1]["result"]["tools"][0]["annotations"]["readOnlyHint"])
+        self.assertFalse(replies[1]["result"]["tools"][0]["annotations"]["destructiveHint"])
         self.assertFalse(replies[2]["result"]["isError"])
         self.assertIn(obs[0]["content"], replies[2]["result"]["content"][0]["text"])
         self.assertTrue(replies[3]["result"]["isError"])
@@ -623,6 +658,7 @@ class TestRendering(OmCase):
         cfg["model_command"] = {"claude": None, "codex": None, "cursor": None}
         self.assertEqual(mem.model_command(cfg, "claude"), ["claude", "-p", "--model", "sonnet"])
         self.assertEqual(mem.model_command(cfg, "codex")[:2], ["codex", "exec"])
+        self.assertIn("--ephemeral", mem.model_command(cfg, "codex"))  # observer calls stay out of `codex resume`
 
 
 if __name__ == "__main__":

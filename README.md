@@ -18,17 +18,17 @@ It is a port of [pi-observational-memory](https://github.com/elpapi42/pi-observa
 | Harness | Works | Reduced | Missing |
 |---|---|---|---|
 | Claude Code | Async Stop observer; PreCompact catch-up; notes after the summary through SessionStart `compact`; `/observational-memory:` commands; SubagentStop per-subagent notes (`/observational-memory:mode agents both`); `recall`; `observational-memory statusline` segment for cc-status | Notes are added after the native summary, never in its place; SessionStart waits up to 30 s for the catch-up | om.tsx's `observational-memory` mode (notes instead of the summary); the in-footer O/C/X gauges; proactive compaction |
-| Codex | Stop observer; PreCompact catch-up; SessionStart `compact` injection; `recall`; the skill | No plugin commands: the agent runs `observational-memory status --harness codex` when asked; the rollout format is unstable, so parsing may break on a Codex update | Statusline; slash commands |
+| Codex | Verified on Codex 0.163.0 (V4): Stop observer; PreCompact catch-up; notes after the compaction through SessionStart `compact`; `recall`; the skill | The plugin's hooks run only after you trust them in `/hooks`. There are no commands: the TUI rejects `/observational-memory:…`, and Codex lists `commands/` as skills, which run `observational-memory status --harness codex` and the like. The rollout format is unstable, so parsing may break on a Codex update | Statusline; slash commands; SubagentStop untested |
 | Cursor | stop observer; preCompact catch-up; `/observational-memory:` commands through beforeSubmitPrompt; `recall`; the skill | No post-compaction hook: the notes go in on the next postToolUse, once, so a turn without a tool call gets none (untested); the transcript format is undocumented | Statusline; a reliable post-compaction injection point |
 
-None of this has run inside a harness yet; see [VERIFIED.md](VERIFIED.md).
+Codex has run it end to end (V3 and V4). Claude Code and Cursor have not run it inside the harness yet. See [VERIFIED.md](VERIFIED.md).
 
 ## Settings
 
 Edit `~/.local/state/observational-memory/config.json`; keys left out keep their defaults (SPEC.md lists them). For example:
 
 ```json
-{"model": "sonnet", "observe_after_tokens": 10000, "model_command": {"codex": ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", "-"]}}
+{"model": "sonnet", "observe_after_tokens": 10000, "model_command": {"codex": ["codex", "exec", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "-"]}}
 ```
 
 `model_command.<harness>` is the headless command that answers the observer, with the prompt on stdin; `{model}` in it becomes `model`. It runs with `OBSERVATIONAL_MEMORY_CHILD=1`, so its own session fires no observational-memory hooks.

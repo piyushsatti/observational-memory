@@ -67,7 +67,7 @@ DEFAULTS = {
 }
 DEFAULT_COMMANDS = {
     "claude": ["claude", "-p", "--model", "{model}"],
-    "codex": ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", "-"],
+    "codex": ["codex", "exec", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "-"],  # --ephemeral: no rollout in the user's session list
 }
 
 # Text that is ours: never observed again when it shows up in a transcript.
@@ -298,6 +298,19 @@ def parse_claude(obj: dict, lineno: int, cfg: dict, main: bool):
 CODEX_INJECTED = ("<environment_context>", "<user_instructions>", "# AGENTS.md", "<permissions")
 
 
+def codex_output_text(out) -> str:
+    """A tool output as text. Codex 0.163 writes custom_tool_call_output.output as a list of
+    {"type": "input_text", "text": ...} items; older rollouts a string, or {"content": ...}."""
+    if isinstance(out, str):
+        return out
+    if isinstance(out, dict) and "content" in out:
+        return codex_output_text(out["content"])
+    if isinstance(out, list) and out and all(isinstance(i, dict) for i in out):
+        texts = [str(i["text"]) if "text" in i else f"[{i.get('type', 'item')}]" for i in out]
+        return "\n".join(t for t in texts if t)
+    return json.dumps(out, ensure_ascii=False)
+
+
 def parse_codex(obj: dict, lineno: int, cfg: dict, main: bool):
     # The rollout format is unstable: only response_item records are read, and unknown shapes are skipped.
     if obj.get("type") != "response_item" or not isinstance(obj.get("payload"), dict):
@@ -319,9 +332,7 @@ def parse_codex(obj: dict, lineno: int, cfg: dict, main: bool):
         args = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
         return {"id": sid, "role": "Assistant", "ts": ts, "text": f"tool {p.get('name', kind)} {clip(args, cfg['tool_input_chars'])}"}
     if kind in ("function_call_output", "custom_tool_call_output"):
-        out = p.get("output", "")
-        out = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
-        return {"id": sid, "role": "Tool result", "ts": ts, "text": clip(out, cfg["tool_text_chars"])}
+        return {"id": sid, "role": "Tool result", "ts": ts, "text": clip(codex_output_text(p.get("output", "")), cfg["tool_text_chars"])}
     return None  # reasoning, compacted, anything new
 
 
@@ -1226,6 +1237,9 @@ RECALL_TOOL = {
         "properties": {"id": {"type": "string", "description": "The observation or reflection id, e.g. d4e5f6a1b2c3"}},
         "required": ["id"],
     },
+    # Codex asks before every MCP call unless the tool says it only reads; under `codex exec`
+    # (approval policy never) an unannotated recall is refused outright.
+    "annotations": {"title": "Recall", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 }
 
 
