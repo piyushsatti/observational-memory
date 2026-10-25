@@ -14,16 +14,15 @@
 // - Recursion guard: the observer's model call (`opencode run --standalone`) runs with
 //   OBSERVATIONAL_MEMORY_CHILD=1, which its private server inherits; there this plugin registers nothing.
 
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
 const BIN = join(process.env.HOME || homedir(), ".local", "bin", "observational-memory")
 const TURN_END = new Set(["session.execution.succeeded", "session.idle"])
 
-// Runs the script with `input` on stdin; resolves {code, stdout}, never rejects. `detached` keeps a
-// turn-end call alive when `opencode run` shuts its server down right after the turn.
-function run(args, input, timeoutMs, detached = false) {
+// Runs the script with `input` on stdin; resolves {code, stdout}, never rejects.
+function run(args, input, timeoutMs) {
   return new Promise((resolve) => {
     let stdout = ""
     let done = false
@@ -35,7 +34,7 @@ function run(args, input, timeoutMs, detached = false) {
     }
     let child
     try {
-      child = spawn(BIN, args, { stdio: ["pipe", "pipe", "ignore"], detached })
+      child = spawn(BIN, args, { stdio: ["pipe", "pipe", "ignore"] })
     } catch {
       return resolve({ code: -1, stdout: "" })
     }
@@ -91,7 +90,16 @@ export default {
           directory: here,
           messages: await messages(sessionID),
         }
-        await run(["hook", "opencode", "stop"], JSON.stringify(payload), 30_000, true)
+        // Synchronous: OpenCode does not wait on this subscription, and `opencode run` shuts its server
+        // down right after the turn, which could cut an async pipe off mid-payload. The script only
+        // mirrors the messages and starts the observer detached, so the block is short.
+        try {
+          spawnSync(BIN, ["hook", "opencode", "stop"], {
+            input: JSON.stringify(payload),
+            stdio: ["pipe", "ignore", "ignore"],
+            timeout: 30_000,
+          })
+        } catch {}
       } finally {
         busy.delete(sessionID)
       }
