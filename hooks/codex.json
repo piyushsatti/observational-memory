@@ -1,0 +1,61 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook codex Stop'",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook codex SubagentStop'",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook codex PreCompact'",
+            "timeout": 10
+          }
+        ],
+        "matcher": "auto|manual"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook codex SessionStart'",
+            "timeout": 60
+          }
+        ],
+        "matcher": "compact"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook codex UserPromptSubmit'",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

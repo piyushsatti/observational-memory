@@ -1,0 +1,64 @@
+{
+  "description": "observational-memory: observe at turn end, catch up before compaction, add the notes after it, answer /observational-memory: commands",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook claude Stop'",
+            "async": true,
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook claude SubagentStop'",
+            "async": true,
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "auto|manual",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook claude PreCompact'",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook claude SessionStart'",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook claude UserPromptSubmit'",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "session_id": "s-codex-1",
+  "turn_id": "turn-3",
+  "transcript_path": "{transcript}",
+  "cwd": "{cwd}",
+  "model": "synthetic-model",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false
+}

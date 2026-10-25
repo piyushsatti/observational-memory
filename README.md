@@ -1,0 +1,49 @@
+# observational-memory
+
+Observational memory beside compaction. As a session runs, an observer model reads the transcript and writes short, rated, timestamped observations, each citing the transcript lines behind it. A reflector distils durable reflections from them, and a dropper retires the ones that are safe to retire. After each compaction, observational-memory adds the notes to the context, after the harness's own summary. The `recall` tool returns the exact transcript lines behind any note's id.
+
+It is a port of [pi-observational-memory](https://github.com/elpapi42/pi-observational-memory) (commit `022da5e`) to plain hooks, and replaces an earlier Claude Code mod ([decisions](https://github.com/piyushsatti/workbench/blob/main/docs/decisions.md#what-each-piece-is)). The model and every deviation are in [SPEC.md](SPEC.md).
+
+## Pieces
+
+- `bin/observational-memory` is one Python 3 script, standard library only, installed to `~/.local/bin/observational-memory` by `install.json`. Hooks and the MCP server call that installed copy.
+- `hooks/claude.json`, `hooks/codex.json` and `hooks/cursor.json` are named by their manifests.
+- `.mcp.json` and `mcp.json` are identical. Each registers the server `observational-memory`, which runs `"$HOME/.local/bin/observational-memory" recall-mcp` through `sh -c`, so `$HOME` expands the same in every harness.
+- `commands/` holds `/observational-memory:status`, `/observational-memory:view`, `/observational-memory:on`, `/observational-memory:off` and `/observational-memory:mode` for Claude Code and Cursor, answered by the prompt hook.
+- `skills/observational-memory/` tells the agent about the notes and `recall`. In Codex it is also how the user reaches observational-memory.
+- Data lives in `~/.local/state/observational-memory/`: `config.json`, and per session `<harness>/<session>.jsonl` (the ledger), `.state.json` and `.lock`, plus `hooks.log` and `observational-memory.log`. All of it is owner-only.
+
+## Harness support
+
+| Harness | Works | Reduced | Missing |
+|---|---|---|---|
+| Claude Code | Async Stop observer; PreCompact catch-up; notes after the summary through SessionStart `compact`; `/observational-memory:` commands; SubagentStop per-subagent notes (`/observational-memory:mode agents both`); `recall`; `observational-memory statusline` segment for cc-status | Notes are added after the native summary, never in its place; SessionStart waits up to 30 s for the catch-up | om.tsx's `observational-memory` mode (notes instead of the summary); the in-footer O/C/X gauges; proactive compaction |
+| Codex | Stop observer; PreCompact catch-up; SessionStart `compact` injection; `recall`; the skill | No plugin commands: the agent runs `observational-memory status --harness codex` when asked; the rollout format is unstable, so parsing may break on a Codex update | Statusline; slash commands |
+| Cursor | stop observer; preCompact catch-up; `/observational-memory:` commands through beforeSubmitPrompt; `recall`; the skill | No post-compaction hook: the notes go in on the next postToolUse, once, so a turn without a tool call gets none (untested); the transcript format is undocumented | Statusline; a reliable post-compaction injection point |
+
+None of this has run inside a harness yet; see [VERIFIED.md](VERIFIED.md).
+
+## Settings
+
+Edit `~/.local/state/observational-memory/config.json`; keys left out keep their defaults (SPEC.md lists them). For example:
+
+```json
+{"model": "sonnet", "observe_after_tokens": 10000, "model_command": {"codex": ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", "-"]}}
+```
+
+`model_command.<harness>` is the headless command that answers the observer, with the prompt on stdin; `{model}` in it becomes `model`. It runs with `OBSERVATIONAL_MEMORY_CHILD=1`, so its own session fires no observational-memory hooks.
+
+## Shell
+
+```
+observational-memory status [--harness h --session s]  gauges and counts (default: the newest ledger)
+observational-memory view [full]                        the notes a compaction would add; full lists dropped ones
+observational-memory mode [main|agents] both|off        show or set the mode (global)
+observational-memory observe --harness h --session s --transcript p [--force]
+observational-memory reflect                            run the reflector and dropper now
+observational-memory inject                             print the rendered notes
+```
+
+## Tests
+
+From the repo root: `python3 -m unittest discover -s tests`. The model is `tests/fake_model.py`, hook stdin comes from `tests/fixtures/`, transcripts are synthetic, and HOME is a temp folder.

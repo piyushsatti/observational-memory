@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "hooks": {
+    "stop": [
+      {
+        "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook cursor stop'"
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook cursor subagentStop'"
+      }
+    ],
+    "preCompact": [
+      {
+        "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook cursor preCompact'"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook cursor postToolUse'"
+      }
+    ],
+    "sessionStart": [
+      {
+        "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook cursor sessionStart'"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "sh -c 'exec \"$HOME/.local/bin/observational-memory\" hook cursor beforeSubmitPrompt'"
+      }
+    ]
+  }
+}

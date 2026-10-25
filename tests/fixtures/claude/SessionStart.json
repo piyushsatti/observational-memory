@@ -1,0 +1,7 @@
+{
+  "session_id": "s-claude-1",
+  "transcript_path": "{transcript}",
+  "cwd": "{cwd}",
+  "hook_event_name": "SessionStart",
+  "source": "compact"
+}

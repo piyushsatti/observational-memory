@@ -1,0 +1,14 @@
+{
+  "conversation_id": "c-cursor-1",
+  "generation_id": "g-9",
+  "transcript_path": "{transcript}",
+  "workspace_roots": [
+    "{cwd}"
+  ],
+  "hook_event_name": "postToolUse",
+  "tool_name": "Shell",
+  "tool_input": {
+    "command": "ls"
+  },
+  "tool_output": "README.md"
+}

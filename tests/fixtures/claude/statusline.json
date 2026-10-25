@@ -1,0 +1,12 @@
+{
+  "session_id": "s-claude-1",
+  "transcript_path": "{transcript}",
+  "cwd": "{cwd}",
+  "model": {
+    "id": "synthetic-model",
+    "display_name": "Synthetic"
+  },
+  "context_window": {
+    "used_percentage": 41.6
+  }
+}

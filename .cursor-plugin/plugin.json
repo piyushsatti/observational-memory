@@ -1,0 +1,13 @@
+{
+  "name": "observational-memory",
+  "version": "2026.10.22",
+  "description": "Observational memory beside compaction: an observer model notes what matters as the session runs, and after each compaction the notes are added after the harness's own summary; a recall tool returns the exact transcript lines behind a note",
+  "author": {
+    "name": "piyushsatti",
+    "email": "49362334+piyushsatti@users.noreply.github.com"
+  },
+  "license": "MIT",
+  "hooks": "./hooks/cursor.json",
+  "mcpServers": "./mcp.json",
+  "skills": "./skills/"
+}

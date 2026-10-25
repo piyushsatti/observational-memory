@@ -1,0 +1,1336 @@
+#!/usr/bin/env -S python3 -I
+"""observational-memory: observational memory beside each harness's own compaction, as plain hooks.
+
+After pi-observational-memory (github.com/elpapi42/pi-observational-memory, commit 022da5e) and the
+Claude mod it replaces (packages/claude-mods/om/hooks/om.tsx). SPEC.md is the model; this is the code.
+
+Once a turn ends with about `observe_after_tokens` of transcript the observer has not read, a detached
+`observational-memory observe` reads that stretch and the observer model writes observations: one-line, timestamped,
+rated, each citing the transcript entries behind it. Once another `reflect_after_tokens` has been
+observed, the reflector distils durable reflections from them, and when the active observations are
+over `pool_target_tokens` the dropper tombstones the ones safe to drop. All of it goes to an
+append-only ledger, ~/.local/state/observational-memory/<harness>/<session>.jsonl, folded on read.
+
+No harness lets a hook replace its compaction summary, so the notes are added after it: PreCompact
+catches the observer up, and the first hook that can add context after the compaction (SessionStart
+`compact` in Claude Code and Codex, the next postToolUse in Cursor) puts the rendered notes in.
+`recall-mcp` serves the `recall` tool, which returns the exact transcript lines behind a note's id.
+
+Standard library only, run as `python3 -I`. Every hook exits at once when OBSERVATIONAL_MEMORY_CHILD is set: the
+observer's own model call sets it, so that call fires no observational-memory hooks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "2026.10.22"
+HARNESSES = ("claude", "codex", "cursor")
+RELEVANCE = ("low", "medium", "high", "critical")
+RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+MEMORY_ID = re.compile(r"^[a-f0-9]{12}$")
+STAMP = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d$")
+
+# Upstream's defaults (src/config.ts) where upstream has the setting, om.tsx's where only it does.
+DEFAULTS = {
+    "mode": "both",  # the main conversation: both (observe, notes after the summary) | off
+    "agents": "off",  # subagents: both (observe each when it stops) | off. om.tsx's default
+    "model": "sonnet",  # om.tsx's default observer model; {model} in a model command
+    "observe_after_tokens": 10_000,
+    "reflect_after_tokens": 20_000,
+    "pool_target_tokens": 10_000,  # upstream observationsPoolTargetTokens: the dropper's target
+    "chunk_tokens": 60_000,  # one observer call reads at most this much, oldest first
+    "summary_max_tokens": 8_000,  # the rendered notes put in after a compaction
+    "worker_memory_max_tokens": 16_000,  # prior notes shown to the observer and reflector
+    "catch_up_calls": 4,  # PreCompact and SubagentStop: at most this many observer calls in a row
+    "inject_wait_seconds": 30,  # SessionStart waits this long for a running catch-up to finish
+    "model_timeout_seconds": 180,
+    "tool_text_chars": 600,  # how much of a tool's result the observer sees (om.tsx)
+    "tool_input_chars": 300,
+    "hook_log": True,  # one line per hook call in hooks.log, content-free
+    # The headless command that answers the observer, reflector and dropper; the prompt goes on stdin.
+    # None picks the default for the harness (Cursor: claude if installed, else codex).
+    "model_command": {"claude": None, "codex": None, "cursor": None},
+}
+DEFAULT_COMMANDS = {
+    "claude": ["claude", "-p", "--model", "{model}"],
+    "codex": ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", "-"],
+}
+
+# Text that is ours: never observed again when it shows up in a transcript.
+NOTES_HEADER = "observational-memory: condensed memories from earlier in this session"
+COMMAND_RE = re.compile(r"^\s*/(?:observational-memory|om)[:\-\s](status|view|on|off|mode)\b\s*(.*)$", re.S | re.I)
+
+
+# ---------------------------------------------------------------- paths, config, small helpers
+
+
+def root() -> Path:
+    """~/.local/state/observational-memory, read from HOME on each call (the tests move HOME)."""
+    return Path(os.path.expanduser("~")) / ".local" / "state" / "observational-memory"
+
+
+def safe(name: str) -> str:
+    """A session id or stream as a file-name part."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(name or "unknown"))[:128] or "unknown"
+
+
+def ledger_path(harness: str, session: str) -> Path:
+    return root() / safe(harness) / f"{safe(session)}.jsonl"
+
+
+def state_path(harness: str, session: str) -> Path:
+    """Mutable per-session bookkeeping beside the ledger: errors, run counts, backoffs, flags."""
+    return root() / safe(harness) / f"{safe(session)}.state.json"
+
+
+def lock_path(harness: str, session: str) -> Path:
+    return root() / safe(harness) / f"{safe(session)}.lock"
+
+
+def tokens(chars: int) -> int:
+    return math.ceil(chars / 4)
+
+
+def clip(text: str, n: int) -> str:
+    return text if len(text) <= n else text[:n] + "…"
+
+
+def one_line(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def now_stamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def local_stamp(iso: str | None) -> str | None:
+    """An ISO timestamp from a transcript as local YYYY-MM-DD HH:MM; None when unreadable."""
+    if not isinstance(iso, str) or not iso:
+        return None
+    try:
+        d = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (d.astimezone() if d.tzinfo else d).strftime("%Y-%m-%d %H:%M")
+
+
+def short_hash(data: bytes | str, n: int = 16) -> str:
+    raw = data.encode() if isinstance(data, str) else data
+    return hashlib.sha256(raw).hexdigest()[:n]
+
+
+def read_json(path: Path, fallback):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return fallback
+
+
+# The ledger, state and logs hold text taken from transcripts: every folder is 0700 and every file 0600.
+
+
+def private_dir(path: Path) -> Path:
+    """Creates `path` (and the folders between it and the state root) owner-only, and tightens any
+    that already exist with wider modes."""
+    top = root()
+    if path != top and top not in path.parents:
+        path.mkdir(parents=True, exist_ok=True)  # not ours (a test's or caller's folder): left as it is
+        return path
+    top.parent.mkdir(parents=True, exist_ok=True)  # ~/.local/state, shared with other tools
+    current = top
+    for part in (None,) + path.relative_to(top).parts:
+        current = current / part if part else current
+        current.mkdir(mode=0o700, exist_ok=True)
+        if current.stat().st_mode & 0o777 != 0o700:
+            os.chmod(current, 0o700)
+    return path
+
+
+def open_private(path: Path, mode: str = "a"):
+    """A text file opened owner-only for appending ("a") or rewriting ("w"); never through a symlink."""
+    private_dir(path.parent)
+    flags = os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW | (os.O_APPEND if mode == "a" else os.O_TRUNC)
+    fd = os.open(path, flags, 0o600)
+    with contextlib.suppress(OSError):
+        os.fchmod(fd, 0o600)  # a file made before this rule
+    return os.fdopen(fd, mode)
+
+
+def write_json(path: Path, value) -> None:
+    """Atomic: a reader sees the old file or the new one."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open_private(tmp, "w") as f:
+        f.write(json.dumps(value, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+def load_config() -> dict:
+    """config.json over DEFAULTS, one level deep (model_command merges per harness)."""
+    cfg = json.loads(json.dumps(DEFAULTS))
+    saved = read_json(root() / "config.json", {})
+    if isinstance(saved, dict):
+        for key, value in saved.items():
+            if key == "model_command" and isinstance(value, dict):
+                cfg["model_command"].update(value)
+            elif key in cfg:
+                cfg[key] = value
+    return cfg
+
+
+def save_config(changes: dict) -> None:
+    """Writes only the keys set here or before: defaults stay defaults."""
+    saved = read_json(root() / "config.json", {})
+    saved = saved if isinstance(saved, dict) else {}
+    saved.update(changes)
+    write_json(root() / "config.json", saved)
+
+
+def load_state(harness: str, session: str) -> dict:
+    s = read_json(state_path(harness, session), {})
+    return s if isinstance(s, dict) else {}
+
+
+def update_state(harness: str, session: str, **changes) -> dict:
+    s = load_state(harness, session)
+    s.update(changes)
+    write_json(state_path(harness, session), s)
+    return s
+
+
+def log(name: str, line: str) -> None:
+    """Appends to ~/.local/state/observational-memory/<name>; never fails a hook."""
+    with contextlib.suppress(OSError):
+        with open_private(root() / name) as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {line}\n")
+
+
+@contextlib.contextmanager
+def session_lock(harness: str, session: str):
+    """One observer, reflector or dropper per session at a time. Yields False when another holds it:
+    the turn that ends meanwhile is caught by the next."""
+    with open_private(lock_path(harness, session)) as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def is_busy(harness: str, session: str) -> bool:
+    if not lock_path(harness, session).exists():
+        return False
+    with session_lock(harness, session) as got:
+        return not got
+
+
+# ---------------------------------------------------------------- transcripts, one parser per harness
+#
+# A parser turns one decoded JSONL line into a source entry the observer reads, or None for lines that
+# carry nothing to observe (thinking, metadata, our own notes). Every source entry has an id: Claude's
+# own `uuid`, else `L<line number>` (Codex rollouts and Cursor transcripts have no per-line id; both
+# are appended to, so a line number stays put). The id is what observations cite and recall looks up.
+
+
+def blocks_text(content, cfg: dict) -> tuple[str, bool]:
+    """Claude/Cursor message content (a string or a list of blocks) as text, and whether it was only
+    tool results. Thinking blocks are left out, which keeps the observer clear of refusals (pi #97)."""
+    if isinstance(content, str):
+        return content, False
+    if not isinstance(content, list):
+        return "", False
+    parts, results, others = [], 0, 0
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        kind = b.get("type")
+        if kind == "text":
+            parts.append(str(b.get("text", "")))
+            others += 1
+        elif kind == "tool_use":
+            parts.append(f"tool {b.get('name')} {clip(json.dumps(b.get('input'), ensure_ascii=False), cfg['tool_input_chars'])}")
+            others += 1
+        elif kind == "tool_result":
+            inner, _ = blocks_text(b.get("content"), cfg)
+            parts.append(f"result: {clip(inner, cfg['tool_text_chars'])}")
+            results += 1
+        elif kind == "image":
+            parts.append("[image]")
+            others += 1
+    return "\n".join(p for p in parts if p), results > 0 and others == 0
+
+
+def ours(text: str) -> bool:
+    return NOTES_HEADER in text[:400]
+
+
+def parse_claude(obj: dict, lineno: int, cfg: dict, main: bool):
+    if obj.get("type") not in ("user", "assistant") or not isinstance(obj.get("message"), dict):
+        return None
+    # Metadata, the engine's own compaction summary, and (older versions) subagent lines in the main file.
+    if obj.get("isMeta") or obj.get("isCompactSummary") or (main and obj.get("isSidechain")):
+        return None
+    text, only_results = blocks_text(obj["message"].get("content"), cfg)
+    if not text.strip() or ours(text):
+        return None
+    role = "Tool result" if only_results else ("User" if obj["type"] == "user" else "Assistant")
+    return {"id": str(obj.get("uuid") or f"L{lineno}"), "role": role, "ts": local_stamp(obj.get("timestamp")), "text": text}
+
+
+# Codex puts its own context in user messages; those are not the person's words.
+CODEX_INJECTED = ("<environment_context>", "<user_instructions>", "# AGENTS.md", "<permissions")
+
+
+def parse_codex(obj: dict, lineno: int, cfg: dict, main: bool):
+    # The rollout format is unstable: only response_item records are read, and unknown shapes are skipped.
+    if obj.get("type") != "response_item" or not isinstance(obj.get("payload"), dict):
+        return None
+    p = obj["payload"]
+    kind = p.get("type")
+    ts = local_stamp(obj.get("timestamp"))
+    sid = f"L{lineno}"
+    if kind == "message":
+        if p.get("role") not in ("user", "assistant"):
+            return None
+        items = p.get("content") if isinstance(p.get("content"), list) else []
+        text = "\n".join(str(i.get("text", "")) for i in items if isinstance(i, dict) and "text" in i)
+        if not text.strip() or text.lstrip().startswith(CODEX_INJECTED) or ours(text):
+            return None
+        return {"id": sid, "role": "User" if p["role"] == "user" else "Assistant", "ts": ts, "text": text}
+    if kind in ("function_call", "custom_tool_call", "local_shell_call"):
+        args = p.get("arguments", p.get("input", p.get("action", "")))
+        args = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+        return {"id": sid, "role": "Assistant", "ts": ts, "text": f"tool {p.get('name', kind)} {clip(args, cfg['tool_input_chars'])}"}
+    if kind in ("function_call_output", "custom_tool_call_output"):
+        out = p.get("output", "")
+        out = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+        return {"id": sid, "role": "Tool result", "ts": ts, "text": clip(out, cfg["tool_text_chars"])}
+    return None  # reasoning, compacted, anything new
+
+
+def parse_cursor(obj: dict, lineno: int, cfg: dict, main: bool):
+    # Undocumented: {"role": ..., "message": {"content": ...}}, with a bare `content` accepted too.
+    role = obj.get("role") or (obj.get("message") or {}).get("role")
+    if role not in ("user", "assistant"):
+        return None
+    msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+    text, only_results = blocks_text(msg.get("content"), cfg)
+    if not text.strip() or ours(text):
+        return None
+    label = "Tool result" if only_results else ("User" if role == "user" else "Assistant")
+    return {"id": f"L{lineno}", "role": label, "ts": local_stamp(obj.get("timestamp")), "text": text}
+
+
+PARSERS = {"claude": parse_claude, "codex": parse_codex, "cursor": parse_cursor}
+
+
+def line_id(harness: str, obj, lineno: int) -> str:
+    """The id a line has whether or not it is a source entry, for recall."""
+    if harness == "claude" and isinstance(obj, dict) and obj.get("uuid"):
+        return str(obj["uuid"])
+    return f"L{lineno}"
+
+
+def iter_lines(path: str, start: int = 0, first_lineno: int = 1):
+    """(offset, line number, raw bytes, decoded object or None) for each line from byte `start`."""
+    with open(path, "rb") as f:
+        f.seek(start)
+        offset, lineno = start, first_lineno
+        for raw in f:
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                obj = None
+            yield offset, lineno, raw, obj
+            offset += len(raw)
+            lineno += 1
+
+
+def render_source(e: dict) -> str:
+    ts = f" @ {e['ts']}" if e.get("ts") else ""
+    return f"[Source entry id: {e['id']}]\n[{e['role']}{ts}]: {e['text']}"
+
+
+def read_sources(harness: str, path: str | None, after: dict | None, main: bool = True) -> list[dict]:
+    """The source entries past the watermark `after` ({id, hash, offset, line}), oldest first.
+
+    The watermark's offset is tried first, so a turn reads only what is new. If the line there is not
+    the one recorded (the file was rewritten), the whole file is searched for it; a watermark the file
+    no longer holds reads from the start, with the earlier notes there to keep the observer from
+    repeating itself."""
+    if not path or not os.path.isfile(path):
+        return []
+    cfg = load_config()
+    parse = PARSERS[harness]
+
+    def collect(lines) -> list[dict]:
+        out = []
+        for offset, lineno, raw, obj in lines:
+            e = parse(obj, lineno, cfg, main) if isinstance(obj, dict) else None
+            if e:
+                e.update(offset=offset, line=lineno, hash=short_hash(raw))
+                e["tokens"] = tokens(len(render_source(e)))
+                out.append(e)
+        return out
+
+    if after and after.get("offset") is not None:
+        with contextlib.suppress(OSError, StopIteration):
+            offset, lineno, raw, _ = next(iter_lines(path, int(after["offset"]), int(after.get("line") or 1)))
+            if short_hash(raw) == after.get("hash"):
+                return collect(iter_lines(path, offset + len(raw), lineno + 1))
+    every = collect(iter_lines(path))
+    if after:
+        for i, e in enumerate(every):
+            if e["id"] == after.get("id") and e["hash"] == after.get("hash"):
+                return every[i + 1 :]
+    return every
+
+
+# ---------------------------------------------------------------- the ledger
+
+
+def read_ledger(harness: str, session: str) -> list[dict]:
+    out = []
+    with contextlib.suppress(OSError):
+        for raw in ledger_path(harness, session).read_text().splitlines():
+            with contextlib.suppress(ValueError):
+                entry = json.loads(raw)
+                if isinstance(entry, dict) and isinstance(entry.get("data"), dict):
+                    out.append(entry)
+    return out
+
+
+def append_ledger(harness: str, session: str, kind: str, data: dict, **extra) -> dict:
+    """One line, appended; nothing in the ledger is ever rewritten."""
+    entry = {"v": 1, "type": kind, "at": datetime.now().isoformat(timespec="seconds"), **extra, "data": data}
+    with open_private(ledger_path(harness, session)) as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return entry
+
+
+def watermark(entries: list[dict], stream: str) -> dict | None:
+    """Where the observer's reading of `stream` resumes: the newest `coversUpTo` of an observations or
+    skip entry for it. A progress marker only; provenance is each observation's sourceEntryIds."""
+    for e in reversed(entries):
+        if e.get("stream", "main") == stream and e["type"] in ("observational-memory.observations.recorded", "observational-memory.coverage.skipped"):
+            mark = e["data"].get("coversUpTo")
+            if isinstance(mark, dict) and mark.get("id"):
+                return mark
+    return None
+
+
+def mark_of(source: dict) -> dict:
+    return {"id": source["id"], "hash": source["hash"], "offset": source["offset"], "line": source["line"]}
+
+
+def fold(entries: list[dict]) -> dict:
+    """The ledger folded: active observations (recorded and not dropped, oldest first), dropped ones,
+    reflections, and each observation's entry (for recall's transcript path)."""
+    observations, origin, reflections, dropped = {}, {}, {}, set()
+    for e in entries:
+        d = e["data"]
+        if e["type"] == "observational-memory.observations.recorded":
+            for o in d.get("observations", []):
+                if isinstance(o, dict) and MEMORY_ID.match(str(o.get("id", ""))):
+                    observations.setdefault(o["id"], {**o, "stream": e.get("stream", "main")})
+                    origin.setdefault(o["id"], e)
+        elif e["type"] == "observational-memory.reflections.recorded":
+            for r in d.get("reflections", []):
+                if isinstance(r, dict) and MEMORY_ID.match(str(r.get("id", ""))):
+                    reflections.setdefault(r["id"], r)
+        elif e["type"] == "observational-memory.observations.dropped":
+            dropped.update(i for i in d.get("observationIds", []) if isinstance(i, str))
+    active = [o for i, o in observations.items() if i not in dropped]
+    return {
+        "active": active,
+        "dropped": [o for i, o in observations.items() if i in dropped],
+        "reflections": list(reflections.values()),
+        "origin": origin,
+    }
+
+
+def observed_tokens(entries: list[dict]) -> int:
+    """Source tokens the observer has covered so far, every stream: the reflector's clock."""
+    return sum(int(e["data"].get("sourceTokens", 0)) for e in entries if e["type"] == "observational-memory.observations.recorded")
+
+
+def memory_id(*parts: str) -> str:
+    """Deterministic 12-character lowercase hex id, as upstream's."""
+    return short_hash("\n".join(parts), 12)
+
+
+def coverage(observation_id: str, reflections: list[dict]) -> str:
+    """Upstream's tier: how many reflections cite an observation."""
+    n = sum(observation_id in r.get("supportingObservationIds", []) for r in reflections)
+    return "none" if n == 0 else "partial" if n == 1 else "strong"
+
+
+def obs_line(o: dict, with_coverage: list[dict] | None = None) -> str:
+    who = f" (subagent {o['stream'][6:14]})" if str(o.get("stream", "main")).startswith("agent:") else ""
+    cov = f" [coverage: {coverage(o['id'], with_coverage)}]" if with_coverage is not None else ""
+    return f"[{o['id']}] {o['timestamp']} [{o['relevance']}]{cov}{who} {o['content']}"
+
+
+def refl_line(r: dict) -> str:
+    return f"[{r['id']}] {r['content']}"
+
+
+# ---------------------------------------------------------------- rendering the notes
+
+
+INSTRUCTIONS = f"""{NOTES_HEADER}, kept by the observational-memory observer and added after this harness's own compaction summary.
+
+- Reflections: stable, long-lived facts about the user, project, decisions and constraints.
+- Observations: timestamped events from the conversation, oldest first, each with its id in brackets.
+
+Treat these as past records. Where they are more specific than the summary above, they hold; when entries conflict, the most recent one is the latest known state, and a later message overrides any note. Work an observation marks as completed should not be redone unless the user asks to revisit it.
+
+When exact source context is needed for precision or traceability, call the `recall` tool (observational-memory MCP server) with the observation's or reflection's id. Do not use it as a broad search."""
+
+
+def pick_within(records: list[dict], line, budget: int) -> tuple[list[dict], int]:
+    """Newest first, skipping (not stopping at) a record that does not fit; returned oldest first."""
+    kept, used = [], 0
+    for r in reversed(records):
+        cost = tokens(len(line(r))) + 1
+        if used + cost > budget:
+            continue
+        used += cost
+        kept.append(r)
+    return kept[::-1], used
+
+
+def render_notes(folded: dict, max_tokens: int) -> tuple[str, list[dict], list[dict]]:
+    """Upstream's renderer: the usage instructions, then reflections and observations within the budget,
+    observations guaranteed half of it. Empty when there is nothing to show. Model-free and verbatim."""
+    refl, obs = folded["reflections"], folded["active"]
+    if not refl and not obs:
+        return "", [], []
+    budget = max(0, max_tokens - tokens(len(INSTRUCTIONS)) - 40)
+    _, reserved = pick_within(obs, obs_line, budget // 2)
+    kept_r, refl_used = pick_within(refl, refl_line, budget - reserved)
+    kept_o, _ = pick_within(obs, obs_line, budget - refl_used)
+    parts = [INSTRUCTIONS]
+    if kept_r:
+        parts.append("## Reflections\n" + "\n".join(map(refl_line, kept_r)))
+    if kept_o:
+        parts.append("## Observations\n" + "\n".join(map(obs_line, kept_o)))
+    left_r, left_o = len(refl) - len(kept_r), len(obs) - len(kept_o)
+    if left_r or left_o:
+        parts.append(f"({left_r} older reflections and {left_o} older observations left out to fit; they stay in the ledger and `recall` still finds them.)")
+    return "\n\n".join(parts), kept_r, kept_o
+
+
+# ---------------------------------------------------------------- the model call
+
+
+class ModelError(Exception):
+    pass
+
+
+def model_command(cfg: dict, harness: str) -> list[str]:
+    cmd = (cfg.get("model_command") or {}).get(harness)
+    if not cmd:
+        if harness == "cursor":
+            # Cursor has no headless CLI here: whichever of the other two is installed.
+            pick = "claude" if shutil.which("claude") else "codex" if shutil.which("codex") else None
+            if pick is None:
+                raise ModelError("no model command: neither claude nor codex is on PATH; set model_command.cursor")
+            cmd = DEFAULT_COMMANDS[pick]
+        else:
+            cmd = DEFAULT_COMMANDS[harness]
+    return [str(part).replace("{model}", str(cfg["model"])) for part in cmd]
+
+
+def call_model(cfg: dict, harness: str, prompt: str) -> str:
+    """One headless call, prompt on stdin, reply on stdout. OBSERVATIONAL_MEMORY_CHILD=1 is the recursion guard: the
+    child session's own hooks see it and do nothing. It runs from the state folder, so no project's
+    instructions or settings reach it."""
+    cmd = model_command(cfg, harness)
+    env = {**os.environ, "OBSERVATIONAL_MEMORY_CHILD": "1"}
+    private_dir(root())
+    try:
+        done = subprocess.run(cmd, input=prompt, capture_output=True, text=True, env=env, cwd=root(), timeout=float(cfg["model_timeout_seconds"]))
+    except FileNotFoundError as err:
+        raise ModelError(f"{cmd[0]} not found") from err
+    except subprocess.TimeoutExpired as err:
+        raise ModelError(f"timed out after {cfg['model_timeout_seconds']}s") from err
+    if done.returncode != 0:
+        raise ModelError(f"{cmd[0]} exited {done.returncode}: {clip(one_line(done.stderr), 300)}")
+    return done.stdout
+
+
+def extract_json(reply: str, key: str) -> dict | None:
+    """The last JSON object in `reply` that has `key`: replies may wrap it in prose or a fence."""
+    decoder = json.JSONDecoder()
+    found = None
+    for i in [m.start() for m in re.finditer(r"\{", reply)]:
+        with contextlib.suppress(ValueError):
+            value, _ = decoder.raw_decode(reply, i)
+            if isinstance(value, dict) and key in value:
+                found = value
+    return found
+
+
+# The three prompts are upstream's (src/agents/*/prompts.ts), condensed, and asked for JSON instead of
+# a tool call: a headless CLI gives us text back, not tool calls.
+
+OBSERVER = """You are the observation agent for a coding assistant. Your observations are the assistant's ONLY memory of this stretch of conversation once it is compacted out of context: what you leave out is forgotten, what you distort is remembered wrong.
+
+You receive current reflections, current observations ("[id] YYYY-MM-DD HH:MM [relevance] content"), the current local time, and a new chunk of conversation. Each block of the chunk starts with "[Source entry id: <id>]".
+
+Emit NEW observations for the new chunk only; do not restate what reflections or observations already hold unless it materially changed.
+- Each observation cites sourceEntryIds: the smallest exact set of ids printed in the chunk that support it. Never invent ids; an observation without valid ids is rejected.
+- timestamp: the relevant message's "YYYY-MM-DD HH:MM"; the current local time only when none applies.
+- content: one line of plain prose, no markdown, no timestamp or relevance inside it.
+- Preserve user assertions as assertions ("User stated they use Postgres"), questions as questions. Quote unusual user terms exactly.
+- Use precise verbs; frame changes as supersession ("will use React Query, switching from SWR"); mark completions ("completed: ...; user confirmed tests pass").
+- One fact per observation; group repeated similar tool calls into one.
+- Keep distinguishing detail verbatim: file paths with line numbers, identifiers, error messages, numbers with units, the attribute that tells listed options apart.
+- Skip routine, low-information events. Zero observations is fine.
+
+relevance: critical = user identity, persistent preferences, explicit corrections, completions that must not be redone; high = non-trivial decisions, direction, blockers, key constraints; medium = task-level context (the default when unsure); low = routine acks and re-derivable detail. Most observations are medium or low.
+
+Reply with only a JSON object, nothing else:
+{"observations": [{"timestamp": "YYYY-MM-DD HH:MM", "relevance": "medium", "content": "...", "sourceEntryIds": ["..."]}]}
+Reply {"observations": []} when nothing new happened."""
+
+REFLECTOR = """You are the reflection agent for a coding assistant. You distil stable, long-lived facts from active observations into a few new reflections. Over-reflection is also distortion: it makes passing detail look durable.
+
+You receive current reflections and active observations ("[id] YYYY-MM-DD HH:MM [relevance] [coverage: none|partial|strong] content"). Coverage says how many current reflections cite an observation; it is context, not a quota.
+
+Emit only new durable reflections not already present:
+- user identity, preferences, constraints and corrections; project goals, architecture and decisions with their rationale; completed outcomes that must not be redone; durable blockers and invariants.
+- Reject transient, routine, partial or current-working-state observations; they stay observations. Do not copy or lightly reword an observation, and do not reword an existing reflection.
+- Would a future assistant need this automatically to avoid a wrong decision, repeated work or a violated preference? If unsure, emit nothing.
+- content: one line of plain prose, fact first, reason when known; keep identifiers, paths, commands and dates that are part of the meaning. User assertions are authoritative over later questions.
+- supportingObservationIds: all and only the current observation ids whose durable meaning this reflection preserves with equivalent fidelity. Never invent ids; never inflate them, since they let later pruning drop those observations.
+
+Reply with only a JSON object, nothing else:
+{"reflections": [{"content": "...", "supportingObservationIds": ["..."]}]}
+Reply {"reflections": []} when nothing is durable enough."""
+
+DROPPER = """You are the dropper agent for a coding assistant. You name only the safest active observations to remove from compacted memory. The default is KEEP; when uncertain, keep. Dropping removes an observation from what the assistant sees, not from the ledger.
+
+You receive the pool target, a hard maximum number of drops (not a goal), current reflections, and active observations ("[id] YYYY-MM-DD HH:MM [relevance] [coverage: none|partial|strong] content").
+
+Drop, in order: observations a reflection already captures with equivalent fidelity; observations a later one clearly supersedes; repeated routine acks and low-signal progress; older ones that no longer carry working context and are covered elsewhere. Prefer older drops to newer working context.
+Relevance is resistance: low first; high only when superseded or captured exactly; critical only with strong evidence (age plus coverage, supersession, redundancy).
+Never drop an observation that uniquely carries a user preference, constraint, correction or identity fact; a completion; a named identifier, path, command, error message or test name; a decision and its rationale; a dated event; an unresolved blocker or pending decision; or the user's own terminology.
+
+Reply with only a JSON object, nothing else:
+{"drop": ["<id>", ...]}
+Reply {"drop": []} when nothing is safe to drop."""
+
+
+def memory_block(folded: dict, cfg: dict, annotate: bool) -> str:
+    """Reflections and the newest active observations within worker_memory_max_tokens."""
+    refl = folded["reflections"]
+    obs, _ = pick_within(folded["active"], lambda o: obs_line(o, refl if annotate else None), int(cfg["worker_memory_max_tokens"]))
+    r = "\n".join(map(refl_line, refl)) or "(none)"
+    o = "\n".join(obs_line(x, refl if annotate else None) for x in obs) or "(none)"
+    return f"Current reflections:\n{r}\n\nCurrent observations:\n{o}"
+
+
+def record_error(harness: str, session: str, who: str, err: Exception) -> None:
+    update_state(harness, session, lastError=f"{now_stamp()} {who}: {err}")
+    log("observational-memory.log", f"{harness} {safe(session)} {who} failed: {err}")
+
+
+def count_run(harness: str, session: str) -> None:
+    s = load_state(harness, session)
+    update_state(harness, session, runs=int(s.get("runs", 0)) + 1)
+
+
+# ---------------------------------------------------------------- observer, reflector, dropper
+
+
+def parse_observations(reply: str, chunk: list[dict], stream: str) -> list[dict]:
+    """The observer's reply as observations: ids and token counts computed here, source ids checked
+    against the chunk, an observation without one valid source rejected."""
+    data = extract_json(reply, "observations") or {}
+    valid = {e["id"] for e in chunk}
+    fallback = next((e["ts"] for e in reversed(chunk) if e.get("ts")), None) or now_stamp()
+    out, seen = [], set()
+    for item in data.get("observations") or []:
+        if not isinstance(item, dict):
+            continue
+        content = one_line(item.get("content", ""))
+        sources = list(dict.fromkeys(s for s in item.get("sourceEntryIds") or [] if isinstance(s, str) and s in valid))
+        if not content or not sources:
+            continue
+        relevance = str(item.get("relevance", "medium")).lower()
+        relevance = relevance if relevance in RELEVANCE else "medium"
+        stamp = str(item.get("timestamp", ""))
+        stamp = stamp if STAMP.match(stamp) else fallback
+        oid = memory_id(stream, stamp, content, ",".join(sources))
+        if oid in seen:
+            continue
+        seen.add(oid)
+        out.append({"id": oid, "content": content, "timestamp": stamp, "relevance": relevance, "sourceEntryIds": sources, "tokenCount": tokens(len(content))})
+    return out
+
+
+def observe_once(harness: str, session: str, transcript: str, stream: str, cfg: dict, force: bool) -> str:
+    """One observer call over the oldest unread chunk. Returns what happened, for the caller's loop:
+    'none' (nothing unread), 'below' (under the threshold), 'backoff', 'empty', 'error' or 'recorded'."""
+    entries = read_ledger(harness, session)
+    sources = read_sources(harness, transcript, watermark(entries, stream), main=stream == "main")
+    if not sources:
+        return "none"
+    unread = sum(e["tokens"] for e in sources)
+    threshold = int(cfg["observe_after_tokens"])
+    state = load_state(harness, session)
+    if not force:
+        if unread < threshold:
+            return "below"
+        # After a deliberate empty run, wait for another threshold's worth before reading it again.
+        back = (state.get("backoff") or {}).get(stream)
+        mark = watermark(entries, stream)
+        if back and back.get("coverage") == (mark or {}).get("id") and unread < int(back.get("tokens", 0)) + threshold:
+            return "backoff"
+    # Oldest first up to chunk_tokens, always at least one entry so a huge one cannot stall coverage.
+    chunk, size = [], 0
+    for e in sources:
+        if chunk and size + e["tokens"] > int(cfg["chunk_tokens"]):
+            break
+        chunk.append(e)
+        size += e["tokens"]
+    prompt = "\n\n".join(
+        [
+            OBSERVER,
+            memory_block(fold(entries), cfg, annotate=False),
+            f"Current local time: {now_stamp()}",
+            "New conversation chunk:\n" + "\n\n".join(map(render_source, chunk)),
+        ]
+    )
+    try:
+        reply = call_model(cfg, harness, prompt)
+    except ModelError as err:
+        record_error(harness, session, "observer", err)
+        return "error"  # the watermark stays put, so this stretch is read again
+    finally:
+        count_run(harness, session)
+    observations = parse_observations(reply, chunk, stream)
+    if not observations:
+        backoff = {**(state.get("backoff") or {}), stream: {"coverage": (watermark(entries, stream) or {}).get("id"), "tokens": unread}}
+        update_state(harness, session, backoff=backoff)
+        return "empty"  # no empty ledger entries; coverage does not advance
+    data = {"observations": observations, "coversUpToId": chunk[-1]["id"], "coversUpTo": mark_of(chunk[-1]), "sourceTokens": size}
+    append_ledger(harness, session, "observational-memory.observations.recorded", data, stream=stream, transcript_path=transcript)
+    backoff = dict(load_state(harness, session).get("backoff") or {})
+    backoff.pop(stream, None)
+    update_state(harness, session, backoff=backoff, lastError=None)
+    return "recorded"
+
+
+def observe(harness: str, session: str, transcript: str, stream: str = "main", force: bool = False, calls: int | None = None) -> str:
+    """The detached worker. Normal turns: at most one observer call, then the reflector when the observer
+    is not due (upstream's priority). force (PreCompact, SubagentStop): up to `calls` observer calls
+    below the threshold too, and no reflector, so the catch-up is as short as it can be."""
+    cfg = load_config()
+    with session_lock(harness, session) as got:
+        if not got:
+            return "busy"
+        result = "none"
+        for _ in range(int(calls or (cfg["catch_up_calls"] if force else 1))):
+            result = observe_once(harness, session, transcript, stream, cfg, force)
+            if result != "recorded":
+                break
+        if not force and result in ("none", "below", "backoff", "recorded"):
+            unread = sum(e["tokens"] for e in read_sources(harness, transcript, watermark(read_ledger(harness, session), stream), main=stream == "main"))
+            if unread < int(cfg["observe_after_tokens"]):
+                reflect_locked(harness, session, cfg, force=False)
+        return result
+
+
+def parse_reflections(reply: str, folded: dict) -> list[dict]:
+    data = extract_json(reply, "reflections") or {}
+    active = {o["id"] for o in folded["active"]}
+    existing = {one_line(r["content"]).lower() for r in folded["reflections"]}
+    out = []
+    for item in data.get("reflections") or []:
+        if not isinstance(item, dict):
+            continue
+        content = one_line(item.get("content", ""))
+        support = list(dict.fromkeys(i for i in item.get("supportingObservationIds") or [] if i in active))
+        if not content or not support or content.lower() in existing:
+            continue
+        existing.add(content.lower())
+        out.append({"id": memory_id("reflection", content, ",".join(support)), "content": content, "supportingObservationIds": support, "tokenCount": tokens(len(content))})
+    return out
+
+
+def reflect_locked(harness: str, session: str, cfg: dict, force: bool) -> str:
+    """The reflector once another reflect_after_tokens has been observed, then the dropper, only after
+    reflections were recorded and only when the active pool is over its target (upstream's order)."""
+    entries = read_ledger(harness, session)
+    total = observed_tokens(entries)
+    last = next((e for e in reversed(entries) if e["type"] == "observational-memory.reflections.recorded"), None)
+    since = total - int((last or {}).get("data", {}).get("observedTokens", 0))
+    state = load_state(harness, session)
+    empty_at = state.get("reflectEmptyAt")
+    folded = fold(entries)
+    if not folded["active"]:
+        return "none"
+    if not force and (since < int(cfg["reflect_after_tokens"]) or (empty_at is not None and total - int(empty_at) < int(cfg["reflect_after_tokens"]))):
+        return "below"
+    prompt = "\n\n".join([REFLECTOR, memory_block(folded, cfg, annotate=True)])
+    try:
+        reply = call_model(cfg, harness, prompt)
+    except ModelError as err:
+        record_error(harness, session, "reflector", err)
+        return "error"
+    finally:
+        count_run(harness, session)
+    reflections = parse_reflections(reply, folded)
+    if not reflections:
+        update_state(harness, session, reflectEmptyAt=total)
+        return "empty"
+    newest = watermark(entries, "main") or {}
+    append_ledger(harness, session, "observational-memory.reflections.recorded", {"reflections": reflections, "coversUpToId": newest.get("id", ""), "observedTokens": total})
+    update_state(harness, session, reflectEmptyAt=None)
+    drop_locked(harness, session, cfg)
+    return "recorded"
+
+
+def drop_locked(harness: str, session: str, cfg: dict) -> str:
+    entries = read_ledger(harness, session)
+    folded = fold(entries)
+    active = folded["active"]
+    pool = sum(int(o.get("tokenCount", 0)) for o in active)
+    target = int(cfg["pool_target_tokens"])
+    if pool <= target or not active:
+        return "below"
+    # Upstream's bound: tokens over target as an approximate observation count.
+    max_drops = max(1, math.ceil((pool - target) / max(1, pool / len(active))))
+    prompt = "\n\n".join(
+        [
+            DROPPER,
+            f"Active observation pool: {pool} tokens; target {target}. Maximum drops allowed this run: {max_drops}.",
+            memory_block(folded, cfg, annotate=True),
+        ]
+    )
+    try:
+        reply = call_model(cfg, harness, prompt)
+    except ModelError as err:
+        record_error(harness, session, "dropper", err)
+        return "error"
+    finally:
+        count_run(harness, session)
+    ids = {o["id"] for o in active}
+    drop = list(dict.fromkeys(i for i in (extract_json(reply, "drop") or {}).get("drop") or [] if i in ids))[:max_drops]
+    if not drop:
+        return "empty"
+    newest = watermark(entries, "main") or {}
+    append_ledger(harness, session, "observational-memory.observations.dropped", {"observationIds": drop, "coversUpToId": newest.get("id", "")})
+    return "recorded"
+
+
+def reflect(harness: str, session: str, force: bool = True) -> str:
+    cfg = load_config()
+    with session_lock(harness, session) as got:
+        return reflect_locked(harness, session, cfg, force) if got else "busy"
+
+
+def spawn_observe(harness: str, session: str, transcript: str, stream: str = "main", force: bool = False) -> None:
+    """`observational-memory observe` detached, so the hook returns at once. OBSERVATIONAL_MEMORY_SYNC=1 runs it in this process (tests)."""
+    if os.environ.get("OBSERVATIONAL_MEMORY_SYNC") == "1":
+        observe(harness, session, transcript, stream, force)
+        return
+    cmd = [sys.executable, "-I", os.path.abspath(__file__), "observe", "--harness", harness, "--session", session, "--transcript", transcript, "--stream", stream]
+    if force:
+        cmd.append("--force")
+    with open_private(root() / "observational-memory.log") as out:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, cwd=root())
+
+
+# ---------------------------------------------------------------- injection, status, view, mode
+
+
+def wait_idle(harness: str, session: str, seconds: float) -> None:
+    """Gives a running catch-up (started at PreCompact) the chance to land before the notes are read."""
+    deadline = time.monotonic() + seconds
+    while is_busy(harness, session) and time.monotonic() < deadline:
+        time.sleep(0.5)
+
+
+def inject(harness: str, session: str, event: str = "cli") -> str:
+    """The rendered notes, recorded in the ledger as what the agent now sees. Empty when off or none."""
+    cfg = load_config()
+    if cfg["mode"] == "off":
+        return ""
+    text, kept_r, kept_o = render_notes(fold(read_ledger(harness, session)), int(cfg["summary_max_tokens"]))
+    if text and event != "cli":
+        data = {"observationIds": [o["id"] for o in kept_o], "reflectionIds": [r["id"] for r in kept_r], "tokens": tokens(len(text)), "event": event}
+        append_ledger(harness, session, "observational-memory.injected", data)
+    return text
+
+
+def bar(fraction: float, width: int = 10) -> str:
+    full = round(min(1.0, max(0.0, fraction)) * width)
+    return "█" * full + "░" * (width - full)
+
+
+def last_transcript(entries: list[dict], stream: str = "main") -> str | None:
+    for e in reversed(entries):
+        if e.get("transcript_path") and e.get("stream", "main") == stream:
+            return e["transcript_path"]
+    return None
+
+
+def unread_tokens(harness: str, session: str, transcript: str | None, entries: list[dict] | None = None) -> int:
+    entries = read_ledger(harness, session) if entries is None else entries
+    return sum(e["tokens"] for e in read_sources(harness, transcript or last_transcript(entries), watermark(entries, "main")))
+
+
+def status_text(harness: str, session: str, transcript: str | None = None) -> str:
+    cfg = load_config()
+    entries = read_ledger(harness, session)
+    folded = fold(entries)
+    state = load_state(harness, session)
+    try:
+        via = model_command(cfg, harness)[0]
+    except ModelError:
+        via = "none found"
+    head = f"observational-memory {cfg['mode']} · agents {cfg['agents']} · observer {cfg['model']} via {via} · {'observing' if is_busy(harness, session) else 'idle'}"
+    unread = unread_tokens(harness, session, transcript, entries)
+    total = observed_tokens(entries)
+    last_r = next((e for e in reversed(entries) if e["type"] == "observational-memory.reflections.recorded"), None)
+    since_r = total - int((last_r or {}).get("data", {}).get("observedTokens", 0))
+    pool = sum(int(o.get("tokenCount", 0)) for o in folded["active"])
+    by = {r: sum(o["relevance"] == r for o in folded["active"]) for r in RELEVANCE}
+    o_t, r_t, p_t = int(cfg["observe_after_tokens"]), int(cfg["reflect_after_tokens"]), int(cfg["pool_target_tokens"])
+    gauge = lambda n, of: f"{f'{min(n, of):,} / {of:,} tok':<24} {bar(n / of if of else 0)} {round(min(1, n / of if of else 0) * 100)}%"  # noqa: E731
+    injected = next((e for e in reversed(entries) if e["type"] == "observational-memory.injected"), None)
+    last_inj = (
+        f"{injected['at']} · {len(injected['data'].get('observationIds', []))} observations, {len(injected['data'].get('reflectionIds', []))} reflections ({injected['data'].get('tokens', 0):,} tok) after the summary"
+        if injected
+        else "none yet"
+    )
+    return "\n".join(
+        [
+            f"{head} · last error: {state.get('lastError') or 'none'}",
+            f"  next observer  {gauge(unread, o_t)}",
+            f"  next reflector {gauge(since_r, r_t)}",
+            f"  active pool    {gauge(pool, p_t)}  (dropper target)",
+            f"  observations {len(folded['active'])} active (critical {by['critical']} · high {by['high']} · medium {by['medium']} · low {by['low']}) · {len(folded['dropped'])} dropped · reflections {len(folded['reflections'])}",
+            f"  last injection {last_inj}",
+            f"  model calls {int(state.get('runs', 0))} · session {harness}/{session}",
+        ]
+    )
+
+
+def view_text(harness: str, session: str, args: str = "") -> str:
+    """/observational-memory:view: the notes as the next compaction would add them. `full`: every observation, dropped too."""
+    cfg = load_config()
+    folded = fold(read_ledger(harness, session))
+    if args.strip().lower() == "full":
+        lines = [f"{len(folded['reflections'])} reflections, {len(folded['active'])} active and {len(folded['dropped'])} dropped observations:"]
+        lines += [f"R {refl_line(r)}" for r in folded["reflections"]]
+        dropped = {o["id"] for o in folded["dropped"]}
+        every = sorted(folded["active"] + folded["dropped"], key=lambda o: o["timestamp"])
+        lines += [f"{'-' if o['id'] in dropped else ' '} {obs_line(o)}" for o in every]
+        return "\n".join(lines)
+    text, _, _ = render_notes(folded, int(cfg["summary_max_tokens"]))
+    return text or f"No notes yet; the observer reads after about {int(cfg['observe_after_tokens']) // 1000}k new tokens."
+
+
+MODE_SAYS = {
+    "both": "observing; after a compaction the notes are added after the harness's own summary",
+    "off": "no observing and nothing added at compaction; the notes are kept",
+}
+
+
+def set_mode(who: str, mode: str, harness: str | None = None, session: str | None = None, transcript: str | None = None) -> str:
+    """/observational-memory:mode, /observational-memory:on, /observational-memory:off; the setting is global. Turning the main conversation back on starts
+    this session's observer from here, rather than reading everything said while it was off (om.tsx)."""
+    key = "mode" if who == "main" else "agents"
+    was = load_config()[key]
+    save_config({key: mode})
+    if who == "main" and was == "off" and mode != "off" and harness and session and transcript:
+        entries = read_ledger(harness, session)
+        sources = read_sources(harness, transcript, watermark(entries, "main"))
+        if sources:
+            append_ledger(harness, session, "observational-memory.coverage.skipped", {"coversUpToId": sources[-1]["id"], "coversUpTo": mark_of(sources[-1])}, stream="main", transcript_path=transcript)
+    extra = "subagents are observed when they stop; " if who == "agents" and mode != "off" else ""
+    return f"observational-memory {who} {mode}: {extra}{MODE_SAYS[mode]}."
+
+
+def mode_command(args: str, **where) -> str:
+    words = args.strip().lower().split()
+    if not words:
+        cfg = load_config()
+        return f"main {cfg['mode']} · agents {cfg['agents']}  (both: the harness's summary with the notes after it · off: the harness's compaction alone)"
+    if len(words) == 1 and words[0] in MODE_SAYS:
+        return set_mode("main", words[0], **where)
+    if len(words) == 2 and words[0] in ("main", "agents") and words[1] in MODE_SAYS:
+        return set_mode(words[0], words[1], **where)
+    return f'Expected [main|agents] both|off; got "{args.strip()}".'
+
+
+def answer_command(name: str, args: str, harness: str, session: str, transcript: str | None) -> str:
+    where = {"harness": harness, "session": session, "transcript": transcript}
+    name = name.lower()
+    if name == "status":
+        return status_text(harness, session, transcript)
+    if name == "view":
+        return view_text(harness, session, args)
+    if name == "on":
+        return set_mode("main", "both", **where)
+    if name == "off":
+        return set_mode("main", "off", **where)
+    return mode_command(args, **where)
+
+
+# ---------------------------------------------------------------- hooks
+
+
+# Each harness's event names, as its hooks file spells them, to one name here.
+EVENTS = {
+    "stop": "stop",
+    "subagentstop": "subagent_stop",
+    "precompact": "pre_compact",
+    "sessionstart": "session_start",
+    "userpromptsubmit": "prompt",
+    "beforesubmitprompt": "prompt",
+    "posttooluse": "post_tool_use",
+}
+
+
+def noop(harness: str, event: str) -> dict | None:
+    """What a hook prints when it has nothing to say. Codex and Cursor hooks must print JSON."""
+    if harness == "claude":
+        return None
+    if harness == "cursor" and event == "prompt":
+        return {"continue": True}
+    return {}
+
+
+def context_output(harness: str, event: str, text: str) -> dict:
+    """Context put into the conversation, in each harness's shape."""
+    if harness == "cursor":
+        return {"additional_context": text}
+    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+
+
+def block_output(harness: str, text: str) -> dict:
+    """A command answered in place of the prompt: the agent never sees it."""
+    if harness == "cursor":
+        return {"continue": False, "user_message": text}
+    return {"decision": "block", "reason": text}
+
+
+def hook(harness: str, event_name: str, payload: dict) -> tuple[dict | None, str]:
+    """One hook call: (what to print, a content-free outcome for hooks.log)."""
+    event = EVENTS.get(event_name.replace("_", "").lower(), event_name.lower())
+    # Cursor names the session conversation_id; the other two session_id.
+    first, second = ("conversation_id", "session_id") if harness == "cursor" else ("session_id", "conversation_id")
+    session = str(payload.get(first) or payload.get(second) or "unknown")
+    transcript = payload.get("transcript_path")
+    cfg = load_config()
+
+    if event == "prompt":
+        m = COMMAND_RE.match(str(payload.get("prompt") or ""))
+        if not m:
+            return noop(harness, event), "pass"
+        return block_output(harness, answer_command(m.group(1), m.group(2), harness, session, transcript)), f"command {m.group(1).lower()}"
+
+    if cfg["mode"] == "off" and event != "subagent_stop":
+        return noop(harness, event), "off"
+
+    if event == "stop":
+        if not transcript:
+            return noop(harness, event), "no-transcript"
+        spawn_observe(harness, session, transcript)
+        return noop(harness, event), "spawned"
+
+    if event == "subagent_stop":
+        # om.tsx kept subagents apart: each one's notes under its own stream, read in one go when it ends.
+        agent = payload.get("agent_id") or payload.get("subagent_id")
+        path = payload.get("agent_transcript_path") or payload.get("subagent_transcript_path")
+        if cfg["agents"] == "off" or not agent or not path:
+            return noop(harness, event), "agents-off" if cfg["agents"] == "off" else "no-agent"
+        spawn_observe(harness, session, path, stream=f"agent:{safe(agent)}", force=True)
+        return noop(harness, event), "spawned-agent"
+
+    if event == "pre_compact":
+        # The notes catch up to the compaction point while the harness summarises.
+        if transcript:
+            spawn_observe(harness, session, transcript, force=True)
+        if harness == "cursor":
+            update_state(harness, session, pendingInject=True)  # no post-compaction hook: next postToolUse
+        return noop(harness, event), "catch-up"
+
+    if event == "session_start":
+        if harness == "cursor":
+            if not load_state(harness, session).get("pendingInject"):
+                return noop(harness, event), "noop"
+        elif payload.get("source") not in (None, "compact"):
+            return noop(harness, event), "not-compact"
+        wait_idle(harness, session, float(cfg["inject_wait_seconds"]))
+        update_state(harness, session, pendingInject=False)
+        text = inject(harness, session, event)
+        return (context_output(harness, event, text), "injected") if text else (noop(harness, event), "empty")
+
+    if event == "post_tool_use" and harness == "cursor":
+        if not load_state(harness, session).get("pendingInject"):
+            return noop(harness, event), "noop"
+        update_state(harness, session, pendingInject=False)  # once, even when there is nothing yet
+        text = inject(harness, session, event)
+        return (context_output(harness, event, text), "injected") if text else (noop(harness, event), "empty")
+
+    return noop(harness, event), "unhandled"
+
+
+def run_hook(harness: str, event: str) -> int:
+    """Reads the hook's stdin, prints its answer. Never fails the harness: an error is logged and the
+    hook prints its no-op answer."""
+    cfg = load_config()
+    if os.environ.get("OBSERVATIONAL_MEMORY_CHILD"):
+        # The recursion guard: this is the observer's own model call. Nothing read, nothing written but
+        # the log line that shows it held.
+        if cfg.get("hook_log", True):
+            log("hooks.log", f"{harness} {event} child-skip")
+        out = noop(harness, EVENTS.get(event.replace("_", "").lower(), event.lower()))
+        if out is not None:
+            print(json.dumps(out))
+        return 0
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+        out, outcome = hook(harness, event, payload if isinstance(payload, dict) else {})
+    except Exception as err:  # noqa: BLE001
+        log("observational-memory.log", f"{harness} {event} hook error: {err!r}")
+        out, outcome = noop(harness, EVENTS.get(event.replace("_", "").lower(), event.lower())), "error"
+    if cfg.get("hook_log", True):
+        log("hooks.log", f"{harness} {event} {outcome}")
+    if out is not None:
+        print(json.dumps(out))
+    return 0
+
+
+# ---------------------------------------------------------------- statusline
+
+
+def statusline(payload: dict) -> str:
+    """A segment for cc-status, from Claude Code's statusLine input: O, the transcript until the next
+    observer run; X, the context used; and the active note count."""
+    cfg = load_config()
+    if cfg["mode"] == "off":
+        return "mem off"
+    session = str(payload.get("session_id") or "")
+    if not session:
+        return "mem"
+    entries = read_ledger("claude", session)
+    unread = unread_tokens("claude", session, payload.get("transcript_path"), entries)
+    o = min(100, round(unread * 100 / max(1, int(cfg["observe_after_tokens"]))))
+    used = (payload.get("context_window") or {}).get("used_percentage")
+    x = f" · X {round(float(used))}%" if isinstance(used, (int, float)) else ""
+    busy = " · observing" if is_busy("claude", session) else ""
+    return f"mem O {o}%{x} · {len(fold(entries)['active'])} notes{busy}"
+
+
+# ---------------------------------------------------------------- recall
+
+
+def ledgers() -> list[tuple[str, str, Path]]:
+    """(harness, session, path) for every ledger, newest first."""
+    found = []
+    for harness in HARNESSES:
+        for path in (root() / harness).glob("*.jsonl"):
+            found.append((path.stat().st_mtime, harness, path.stem, path))
+    return [(h, s, p) for _, h, s, p in sorted(found, reverse=True)]
+
+
+def transcript_lines(harness: str, path: str | None, ids: list[str]) -> tuple[dict[str, str], str | None]:
+    """The exact transcript lines with these ids, and why not when the file cannot be read."""
+    if not path or not os.path.isfile(path):
+        return {}, f"transcript not readable: {path}"
+    want, out = set(ids), {}
+    for _, lineno, raw, obj in iter_lines(path):
+        lid = line_id(harness, obj, lineno)
+        if lid in want:
+            out[lid] = raw.decode("utf-8", "replace").rstrip("\n")
+    return out, None
+
+
+RECALL_MAX_CHARS = 60_000
+
+
+def recall(memory_id_: str) -> str:
+    """The `recall` tool: the observation (active or dropped) or reflection with this id, and the exact
+    transcript lines behind it. Every ledger is searched, newest first; ids are content hashes."""
+    mid = str(memory_id_ or "").strip().lower().strip("[]")
+    if not MEMORY_ID.match(mid):
+        return f"invalid id {memory_id_!r}: expected 12 lowercase hex characters, as in [d4e5f6a1b2c3]"
+    for harness, session, _ in ledgers():
+        entries = read_ledger(harness, session)
+        folded = fold(entries)
+        everything = {o["id"]: o for o in folded["active"] + folded["dropped"]}
+        dropped = {o["id"] for o in folded["dropped"]}
+        targets, lines = [], []
+        reflection = next((r for r in folded["reflections"] if r["id"] == mid), None)
+        if reflection:
+            lines.append(f"reflection {refl_line(reflection)}")
+            targets = [everything[i] for i in reflection.get("supportingObservationIds", []) if i in everything]
+        elif mid in everything:
+            targets = [everything[mid]]
+        else:
+            continue
+        lines.append(f"session {harness}/{session}")
+        size = 0
+        for o in targets:
+            origin = folded["origin"].get(o["id"], {})
+            path = origin.get("transcript_path")
+            lines.append(f"\nobservation ({'dropped' if o['id'] in dropped else 'active'}) {obs_line(o)}")
+            found, problem = transcript_lines(harness, path, o["sourceEntryIds"])
+            if problem:
+                lines.append(problem)
+            for sid in o["sourceEntryIds"]:
+                if sid not in found:
+                    lines.append(f"source {sid}: not in the transcript any more")
+                    continue
+                text = found[sid]
+                if size + len(text) > RECALL_MAX_CHARS:
+                    lines.append(f"source {sid}: {len(text):,} characters, left out (recall output limit)")
+                    continue
+                size += len(text)
+                lines.append(f"source {sid} (transcript line):\n{text}")
+        return "\n".join(lines)
+    return f"no observation or reflection {mid} in any observational-memory ledger"
+
+
+RECALL_TOOL = {
+    "name": "recall",
+    "description": "Return the exact transcript lines behind a memory id (the 12-character hex id in brackets in observational-memory's notes). Use it when a note matters and its exact source is needed; it is not a search.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"id": {"type": "string", "description": "The observation or reflection id, e.g. d4e5f6a1b2c3"}},
+        "required": ["id"],
+    },
+}
+
+
+def mcp_reply(message: dict) -> dict | None:
+    """One JSON-RPC message to the minimal MCP server: initialize, tools/list, tools/call, ping."""
+    method, mid = message.get("method"), message.get("id")
+    if mid is None:
+        return None  # a notification (notifications/initialized and the like)
+    if method == "initialize":
+        version = (message.get("params") or {}).get("protocolVersion") or "2025-06-18"
+        result = {"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": "observational-memory", "version": VERSION}}
+    elif method == "tools/list":
+        result = {"tools": [RECALL_TOOL]}
+    elif method == "tools/call":
+        params = message.get("params") or {}
+        if params.get("name") != "recall":
+            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": f"unknown tool {params.get('name')!r}"}}
+        text = recall((params.get("arguments") or {}).get("id", ""))
+        result = {"content": [{"type": "text", "text": text}], "isError": text.startswith(("invalid id", "no observation"))}
+    elif method == "ping":
+        result = {}
+    else:
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"method not found: {method}"}}
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def recall_mcp() -> int:
+    """Newline-delimited JSON-RPC on stdin and stdout, until stdin closes."""
+    for raw in sys.stdin:
+        if not raw.strip():
+            continue
+        try:
+            message = json.loads(raw)
+        except ValueError:
+            reply = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
+        else:
+            reply = mcp_reply(message) if isinstance(message, dict) else None
+        if reply is not None:
+            sys.stdout.write(json.dumps(reply) + "\n")
+            sys.stdout.flush()
+    return 0
+
+
+# ---------------------------------------------------------------- command line
+
+
+def pick_session(args) -> tuple[str, str]:
+    """--harness and --session, or the most recently written ledger."""
+    if args.harness and args.session:
+        return args.harness, args.session
+    for harness, session, _ in ledgers():
+        if not args.harness or harness == args.harness:
+            return harness, session
+    raise SystemExit("observational-memory: no ledger yet; pass --harness and --session")
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="observational-memory", description="Observational memory beside compaction, as hooks.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    h = sub.add_parser("hook", help="run as a harness hook: reads its JSON on stdin")
+    h.add_argument("harness", choices=HARNESSES)
+    h.add_argument("event")
+    o = sub.add_parser("observe", help="the observer worker (the Stop hook starts it detached)")
+    o.add_argument("--harness", choices=HARNESSES, required=True)
+    o.add_argument("--session", required=True)
+    o.add_argument("--transcript", required=True)
+    o.add_argument("--stream", default="main")
+    o.add_argument("--force", action="store_true", help="read below the threshold, up to catch_up_calls chunks")
+    for name, text in (("reflect", "run the reflector (and dropper) now"), ("inject", "print the notes a compaction would add"), ("status", "observer state and gauges"), ("view", "the notes; `full` lists dropped ones too")):
+        q = sub.add_parser(name, help=text)
+        q.add_argument("--harness", choices=HARNESSES)
+        q.add_argument("--session")
+        if name == "view":
+            q.add_argument("which", nargs="?", default="")
+    m = sub.add_parser("mode", help="show or set the mode (global)")
+    m.add_argument("words", nargs="*", help="[main|agents] both|off")
+    sub.add_parser("statusline", help="a status segment from Claude Code's statusLine JSON on stdin")
+    sub.add_parser("recall-mcp", help="MCP stdio server with the recall tool")
+    args = p.parse_args(argv)
+
+    if args.cmd == "hook":
+        return run_hook(args.harness, args.event)
+    if args.cmd == "observe":
+        print(observe(args.harness, args.session, args.transcript, args.stream, args.force))
+        return 0
+    if args.cmd == "recall-mcp":
+        return recall_mcp()
+    if args.cmd == "statusline":
+        raw = sys.stdin.read()
+        print(statusline(json.loads(raw) if raw.strip() else {}))
+        return 0
+    if args.cmd == "mode":
+        print(mode_command(" ".join(args.words)))
+        return 0
+    harness, session = pick_session(args)
+    if args.cmd == "reflect":
+        print(reflect(harness, session))
+    elif args.cmd == "inject":
+        print(inject(harness, session))
+    elif args.cmd == "status":
+        print(status_text(harness, session))
+    elif args.cmd == "view":
+        print(view_text(harness, session, args.which))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

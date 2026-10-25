@@ -1,0 +1,11 @@
+{
+  "conversation_id": "c-cursor-1",
+  "generation_id": "g-9",
+  "transcript_path": "{transcript}",
+  "workspace_roots": [
+    "{cwd}"
+  ],
+  "hook_event_name": "subagentStop",
+  "subagent_id": "sub-42",
+  "agent_transcript_path": "{agent_transcript}"
+}

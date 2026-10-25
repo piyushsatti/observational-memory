@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "observational-memory": {
+      "command": "sh",
+      "args": ["-c", "exec \"$HOME/.local/bin/observational-memory\" recall-mcp"]
+    }
+  }
+}
