@@ -8,7 +8,8 @@
 //   append-only JSONL and starts the observer, detached.
 // - Compaction: the session "compaction" hook runs before the summary model call. `hook opencode
 //   compacting` catches the observer up and answers {"context": notes}; the notes are pushed onto the
-//   compaction's system prompt, so they go into the summary input.
+//   compaction's system prompt, so they go into the summary input. A child session (a subagent's)
+//   sends its parent's id at turn end and compaction alike; its notes go to the parent's ledger.
 // - `recall`: a plugin tool that runs `observational-memory recall <id>`.
 // - Recursion guard: the observer's model call (`opencode run --standalone`) runs with
 //   OBSERVATIONAL_MEMORY_CHILD=1, which its private server inherits; there this plugin registers nothing.
@@ -110,7 +111,12 @@ export default {
     })()
 
     await ctx.session.hook("compaction", async (event) => {
-      const payload = { session_id: event.sessionID, directory: here, messages: await messages(event.sessionID) }
+      const payload = {
+        session_id: event.sessionID,
+        parent_session_id: await parentOf(event.sessionID),
+        directory: here,
+        messages: await messages(event.sessionID),
+      }
       const { stdout } = await run(["hook", "opencode", "compacting"], JSON.stringify(payload), 120_000)
       try {
         const out = JSON.parse(stdout || "{}")

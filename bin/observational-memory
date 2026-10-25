@@ -603,7 +603,7 @@ def refl_line(r: dict) -> str:
 # ---------------------------------------------------------------- rendering the notes
 
 
-INSTRUCTIONS = f"""{NOTES_HEADER}, kept by the observational-memory observer and added after this harness's own compaction summary.
+INSTRUCTIONS = f"""{NOTES_HEADER}, kept by the observational-memory observer and added to this harness's own compaction (after its summary, or in OpenCode into its input).
 
 - Reflections: stable, long-lived facts about the user, project, decisions and constraints.
 - Observations: timestamped events from the conversation, oldest first, each with its id in brackets.
@@ -662,7 +662,8 @@ def model_command(cfg: dict, harness: str) -> list[str]:
             last = ("opencode",) if harness == "opencode" else ()
             pick = next((c for c in ("claude", "codex", *last) if shutil.which(c)), None)
             if pick is None:
-                raise ModelError(f"no model command: neither claude nor codex is on PATH; set model_command.{harness}")
+                names = "claude, codex nor opencode is" if last else "claude nor codex is"
+                raise ModelError(f"no model command: neither {names} on PATH; set model_command.{harness}")
             cmd = DEFAULT_COMMANDS[pick]
         else:
             cmd = DEFAULT_COMMANDS[harness]
@@ -960,17 +961,29 @@ def reflect(harness: str, session: str, force: bool = True) -> str:
         return reflect_locked(harness, session, cfg, force) if got else "busy"
 
 
-def spawn_observe(harness: str, session: str, transcript: str, stream: str = "main", force: bool = False) -> subprocess.Popen | None:
+def spawn_observe(harness: str, session: str, transcript: str, stream: str = "main", force: bool = False) -> subprocess.Popen | str:
     """`observational-memory observe` detached, so the hook returns at once; the handle lets a caller
-    wait for it. OBSERVATIONAL_MEMORY_SYNC=1 runs it in this process (tests) and returns None."""
+    wait for it. OBSERVATIONAL_MEMORY_SYNC=1 runs it in this process (tests) and returns its result."""
     if os.environ.get("OBSERVATIONAL_MEMORY_SYNC") == "1":
-        observe(harness, session, transcript, stream, force)
-        return None
+        return observe(harness, session, transcript, stream, force)
     cmd = [sys.executable, "-I", os.path.abspath(__file__), "observe", "--harness", harness, "--session", session, "--transcript", transcript, "--stream", stream]
     if force:
         cmd.append("--force")
     with open_private(root() / "observational-memory.log") as out:
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, cwd=root())
+
+
+BUSY_EXIT = 75  # `observational-memory observe` found another run holding the lock and did nothing
+
+
+def await_observe(run: subprocess.Popen | str, deadline: float) -> bool:
+    """Waits for spawn_observe's run until `deadline` (time.monotonic()); True when it found the lock
+    held and did nothing."""
+    if isinstance(run, str):
+        return run == "busy"
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        return run.wait(timeout=max(0.0, deadline - time.monotonic())) == BUSY_EXIT
+    return False
 
 
 # ---------------------------------------------------------------- injection, status, view, mode
@@ -1070,17 +1083,36 @@ MODE_SAYS = {
 }
 
 
+def skip_to_end(harness: str, session: str, transcript: str) -> None:
+    """Moves the main watermark to the current end of the transcript, unread (om.tsx: read on from here)."""
+    sources = read_sources(harness, transcript, watermark(read_ledger(harness, session), "main"))
+    if sources:
+        append_ledger(harness, session, "observational-memory.coverage.skipped", {"coversUpToId": sources[-1]["id"], "coversUpTo": mark_of(sources[-1])}, stream="main", transcript_path=transcript)
+
+
+def skip_if_pending(harness: str, session: str, transcript: str) -> None:
+    """The skip `mode both` from a shell could not write at once, written by the session's next hook."""
+    if load_state(harness, session).get("skipPending"):
+        skip_to_end(harness, session, transcript)
+        update_state(harness, session, skipPending=False)
+
+
 def set_mode(who: str, mode: str, harness: str | None = None, session: str | None = None, transcript: str | None = None) -> str:
     """/observational-memory:mode, /observational-memory:on, /observational-memory:off; the setting is global. Turning the main conversation back on starts
-    this session's observer from here, rather than reading everything said while it was off (om.tsx)."""
+    this session's observer from here, rather than reading everything said while it was off (om.tsx).
+    From a shell (`mode both --harness h [--session s]`) there is no transcript path: the ledger's last
+    one is used, and when there is none, or the harness is OpenCode (whose mirror holds nothing said
+    while off, since the plugin's calls stop there), the session's next hook writes the skip."""
     key = "mode" if who == "main" else "agents"
     was = load_config()[key]
     save_config({key: mode})
-    if who == "main" and was == "off" and mode != "off" and harness and session and transcript:
-        entries = read_ledger(harness, session)
-        sources = read_sources(harness, transcript, watermark(entries, "main"))
-        if sources:
-            append_ledger(harness, session, "observational-memory.coverage.skipped", {"coversUpToId": sources[-1]["id"], "coversUpTo": mark_of(sources[-1])}, stream="main", transcript_path=transcript)
+    if who == "main" and was == "off" and mode != "off" and harness and session:
+        if transcript is None and harness != "opencode":
+            transcript = last_transcript(read_ledger(harness, session))
+        if transcript:
+            skip_to_end(harness, session, transcript)
+        else:
+            update_state(harness, session, skipPending=True)
     extra = "subagents are observed when they stop; " if who == "agents" and mode != "off" else ""
     return f"observational-memory {who} {mode}: {extra}{MODE_SAYS[mode]}."
 
@@ -1181,6 +1213,9 @@ def hook(harness: str, event_name: str, payload: dict) -> tuple[dict | None, str
     if cfg["mode"] == "off" and event != "subagent_stop":
         return noop(harness, event), "off"
 
+    if transcript and event != "subagent_stop":
+        skip_if_pending(harness, session, transcript)
+
     if event == "stop":
         if not transcript:
             return noop(harness, event), "no-transcript"
@@ -1229,33 +1264,39 @@ def hook_opencode(event: str, session: str, payload: dict, cfg: dict) -> tuple[d
     """The OpenCode plugin's two calls. Its payload carries the session's messages (ctx.session.context)
     rather than a transcript path; they are mirrored first and the mirror is the transcript.
 
-    stop: a turn ended; observe, detached. A child session (a subagent's) goes to its parent's
-    ledger under stream agent:<child>, as SubagentStop does, and only with `agents both`.
+    stop: a turn ended; observe, detached.
     compacting: catch up, wait for it like SessionStart does, and answer {"context": notes}, which the
-    plugin adds to the compaction's system prompt."""
-    if cfg["mode"] == "off" and not (event == "stop" and payload.get("parent_session_id")):
+    plugin adds to the compaction's system prompt.
+    A child session (a subagent's) goes to its parent's ledger under stream agent:<child>, as
+    SubagentStop does, and only with `agents both`, at its turn ends and its own compactions alike."""
+    parent = payload.get("parent_session_id")
+    if cfg["mode"] == "off" and not parent:
         return {}, "off"
     messages = payload.get("messages")
-    if event == "stop":
-        parent = payload.get("parent_session_id")
-        if parent:
-            if cfg["agents"] == "off":
-                return {}, "agents-off"
-            path = sync_opencode(session, messages)
-            spawn_observe("opencode", str(parent), path, stream=f"agent:{safe(session)}", force=True)
-            return {}, "spawned-agent"
+    if parent and event in ("stop", "compacting"):
+        if cfg["agents"] == "off":
+            return {}, "agents-off"
+        # Nothing goes into a child's compaction: SubagentStop adds nothing to a subagent either, the
+        # child's notes are for the parent's next compaction, and the parent's notes are another
+        # conversation's. The mirror is append-only, so the catch-up need not finish before it.
         path = sync_opencode(session, messages)
+        spawn_observe("opencode", str(parent), path, stream=f"agent:{safe(session)}", force=True)
+        return {}, "spawned-agent"
+    if event == "stop":
+        path = sync_opencode(session, messages)
+        skip_if_pending("opencode", session, path)
         spawn_observe("opencode", session, path)
         return {}, "spawned"
     if event == "compacting":
         path = sync_opencode(session, messages)
+        skip_if_pending("opencode", session, path)
         deadline = time.monotonic() + float(cfg["inject_wait_seconds"])
-        proc = spawn_observe("opencode", session, path, force=True)
-        if proc is not None:
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-        # It returns at once when a turn-end observer holds the lock; wait for that one instead.
+        busy = await_observe(spawn_observe("opencode", session, path, force=True), deadline)
         wait_idle("opencode", session, max(0.0, deadline - time.monotonic()))
+        if busy:
+            # A turn-end observer held the lock, so the forced catch-up did nothing: run it again after
+            # that one, still at most catch_up_calls observer calls in all.
+            await_observe(spawn_observe("opencode", session, path, force=True), deadline)
         text = inject("opencode", session, event)
         return ({"context": f"{OPENCODE_PREAMBLE}\n\n{text}"}, "injected") if text else ({}, "empty")
     return {}, "unhandled"
@@ -1466,6 +1507,8 @@ def main(argv: list[str] | None = None) -> int:
             q.add_argument("which", nargs="?", default="")
     m = sub.add_parser("mode", help="show or set the mode (global)")
     m.add_argument("words", nargs="*", help="[main|agents] both|off")
+    m.add_argument("--harness", choices=HARNESSES, help="turning on: start this harness's session from here (the newest, or --session)")
+    m.add_argument("--session")
     sub.add_parser("statusline", help="a status segment from Claude Code's statusLine JSON on stdin")
     sub.add_parser("recall-mcp", help="MCP stdio server with the recall tool")
     r = sub.add_parser("recall", help="the recall tool once, from a shell or the OpenCode plugin")
@@ -1475,8 +1518,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "hook":
         return run_hook(args.harness, args.event)
     if args.cmd == "observe":
-        print(observe(args.harness, args.session, args.transcript, args.stream, args.force))
-        return 0
+        result = observe(args.harness, args.session, args.transcript, args.stream, args.force)
+        print(result)
+        return BUSY_EXIT if result == "busy" else 0
     if args.cmd == "recall-mcp":
         return recall_mcp()
     if args.cmd == "recall":
@@ -1487,7 +1531,11 @@ def main(argv: list[str] | None = None) -> int:
         print(statusline(json.loads(raw) if raw.strip() else {}))
         return 0
     if args.cmd == "mode":
-        print(mode_command(" ".join(args.words)))
+        where = {}
+        if args.harness:
+            with contextlib.suppress(SystemExit):  # no ledger for the harness: no session to name
+                where["harness"], where["session"] = pick_session(args)
+        print(mode_command(" ".join(args.words), **where))
         return 0
     harness, session = pick_session(args)
     if args.cmd == "reflect":

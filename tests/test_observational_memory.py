@@ -9,6 +9,7 @@ Hook stdin comes from tests/fixtures/<harness>/<event>.json; transcripts are syn
 
 from __future__ import annotations
 
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
@@ -16,6 +17,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -515,6 +517,23 @@ class TestCommands(OmCase):
         self.hook("claude", "Stop", transcript=path)
         self.assertTrue(all(i >= "u-0012" for i in self.calls()[0]["ids"]))
 
+    def test_mode_both_from_the_shell_starts_the_newest_session_from_here(self):
+        cli = lambda *a: subprocess.run([sys.executable, "-I", str(SCRIPT), "mode", *a], capture_output=True, text=True, env=dict(os.environ), timeout=30).stdout  # noqa: E731
+        path = self.transcript("codex", 12)
+        self.hook("codex", "Stop", transcript=path)
+        self.assertIn("main off", cli("off"))
+        write_lines(path, codex_lines(12, 24), append=True)  # said while off
+        before = len(self.calls())
+        self.assertIn("main both", cli("both", "--harness", "codex"))
+        skipped = self.entries("codex", "observational-memory.coverage.skipped")
+        self.assertEqual([e["data"]["coversUpToId"] for e in skipped], ["L36"])
+        self.hook("codex", "Stop", transcript=path)
+        self.assertEqual(len(self.calls()), before)  # what was said while off is not read
+        write_lines(path, codex_lines(36, 12), append=True)
+        self.hook("codex", "Stop", transcript=path)
+        observer = [c for c in self.calls()[before:] if c["kind"] == "observer"]
+        self.assertTrue(observer and all(int(i[1:]) > 36 for c in observer for i in c["ids"]))
+
     def test_mode_command(self):
         self.assertIn("main both · agents off", mem.mode_command(""))
         self.assertIn("observational-memory agents both", mem.mode_command("agents both"))
@@ -761,6 +780,45 @@ class TestOpenCode(OmCase):
         self.assertEqual({e["stream"] for e in recorded}, {"agent:ses_child1"})
         self.assertFalse(mem.ledger_path("opencode", "ses_child1").exists())
 
+    def test_child_compaction_is_observed_like_its_stop_and_adds_nothing(self):
+        # The plugin sends parent_session_id on compaction too; stop-child's payload is that shape.
+        self.assertEqual(self.hook("opencode", "compacting", fixture_event="stop-child")[0], "{}")
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(mem.opencode_transcript("ses_child1").exists())
+        mem.save_config({"agents": "both"})
+        self.assertEqual(self.hook("opencode", "compacting", fixture_event="stop-child")[0], "{}")
+        recorded = self.entries("opencode", "observational-memory.observations.recorded")
+        self.assertEqual({e["stream"] for e in recorded}, {"agent:ses_child1"})
+        self.assertFalse(mem.ledger_path("opencode", "ses_child1").exists())
+        self.assertEqual(self.entries("opencode", "observational-memory.injected"), [])
+
+    def test_compacting_catches_up_after_a_turn_end_observer_holding_the_lock(self):
+        mem.save_config({"inject_wait_seconds": 20})
+        held = mem.open_private(mem.lock_path("opencode", self.SESSION))
+        fcntl.flock(held, fcntl.LOCK_EX)  # a turn-end observer's lock
+        transcript = mem.sync_opencode(self.SESSION, self.payload("compacting")["messages"])
+        cli = subprocess.run([sys.executable, "-I", str(SCRIPT), "observe", "--harness", "opencode", "--session", self.SESSION, "--transcript", transcript, "--force"], capture_output=True, text=True, env=dict(os.environ), timeout=30)
+        self.assertEqual((cli.stdout.strip(), cli.returncode), ("busy", mem.BUSY_EXIT))
+        threading.Timer(1.0, held.close).start()  # it finishes while the compaction hook waits
+        out, _ = self.hook("opencode", "compacting")
+        recorded = self.entries("opencode", "observational-memory.observations.recorded")
+        self.assertEqual(len(recorded), 1)  # the forced catch-up ran again once the lock was free
+        self.assertIn(f"[{recorded[0]['data']['observations'][0]['id']}]", json.loads(out)["context"])
+
+    def test_on_from_the_shell_skips_what_was_said_while_off(self):
+        self.hook("opencode", "stop")
+        subprocess.run([sys.executable, "-I", str(SCRIPT), "mode", "off"], capture_output=True, env=dict(os.environ), timeout=30)
+        self.hook("opencode", "stop", fixture_event="stop-after-compaction")  # off: not mirrored
+        done = subprocess.run([sys.executable, "-I", str(SCRIPT), "mode", "both", "--harness", "opencode"], capture_output=True, text=True, env=dict(os.environ), timeout=30)
+        self.assertIn("main both", done.stdout)
+        self.assertTrue(mem.load_state("opencode", self.SESSION)["skipPending"])  # the mirror is behind
+        before = len(self.calls())
+        self.hook("opencode", "stop", fixture_event="stop-after-compaction")
+        skipped = self.entries("opencode", "observational-memory.coverage.skipped")
+        self.assertEqual([e["data"]["coversUpToId"] for e in skipped], ["msg_0008asst"])
+        self.assertFalse(mem.load_state("opencode", self.SESSION)["skipPending"])
+        self.assertEqual(len(self.calls()), before)
+
     def test_recursion_guard(self):
         for event in ("stop", "compacting"):
             out, ledger = self.hook("opencode", event, env={"OBSERVATIONAL_MEMORY_CHILD": "1"})
@@ -787,6 +845,7 @@ class TestOpenCode(OmCase):
         for call in ('["hook", "opencode", "stop"]', '["hook", "opencode", "compacting"]', '["recall", '):
             self.assertIn(call, js)
         self.assertIn('ctx.session.hook("compaction"', js)
+        self.assertEqual(js.count("parent_session_id: await parentOf("), 2)  # turn end and compaction
         manifest = json.loads((HERE.parent / "install.json").read_text())
         self.assertIn({"src": "opencode/observational-memory.js", "dest": "~/.config/opencode/plugins/observational-memory.js", "mode": "0644"}, manifest["files"])
 
