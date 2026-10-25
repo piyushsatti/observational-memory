@@ -347,6 +347,14 @@ def parse_codex(obj: dict, lineno: int, cfg: dict, main: bool):
     return None  # reasoning, compacted, anything new
 
 
+# Cursor's own text in user messages (seen in real transcripts): subagent lists, tool rules, follow-up nudges.
+CURSOR_INJECTED = (
+    "<available_subagent_types>",
+    "If the available MCP tools do not fully support",
+    "<user_query>Briefly inform the user about the task result",
+)
+
+
 def parse_cursor(obj: dict, lineno: int, cfg: dict, main: bool):
     # Undocumented: {"role": ..., "message": {"content": ...}}, with a bare `content` accepted too.
     role = obj.get("role") or (obj.get("message") or {}).get("role")
@@ -354,7 +362,7 @@ def parse_cursor(obj: dict, lineno: int, cfg: dict, main: bool):
         return None
     msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
     text, only_results = blocks_text(msg.get("content"), cfg)
-    if not text.strip() or ours(text):
+    if not text.strip() or ours(text) or (role == "user" and text.lstrip().startswith(CURSOR_INJECTED)):
         return None
     label = "Tool result" if only_results else ("User" if role == "user" else "Assistant")
     return {"id": f"L{lineno}", "role": label, "ts": local_stamp(obj.get("timestamp")), "text": text}

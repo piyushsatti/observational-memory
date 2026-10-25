@@ -28,6 +28,14 @@ One row per run, on the [verification ladder](https://github.com/piyushsatti/wor
 
 V2 shows the script handles the documented and assumed input shapes. It does not show that any harness sends those shapes.
 
+## Cursor, 2026-10-25: what was checked without a signed-in Cursor
+
+V3 and V4 need a signed-in Cursor; the Cursor agent CLI here (2026.10.22) reports `Not logged in`. What was checked instead:
+
+- **The parser on real transcripts.** All 155 agent transcripts under `~/.cursor/projects/*/agent-transcripts/` (9,511 lines) parse with no errors and no empty files. Lines are `{"role", "message": {"content": [...]}}` with `text` and `tool_use` parts, plus `{"type": "turn_ended", "status"}` lines. They carry no tool results and no per-line timestamps, so the observer sees tool calls but not their output. Three kinds of user message are Cursor's own text (the subagent list, an MCP tool rule, a follow-up nudge); the parser now skips them (`CURSOR_INJECTED`, with a test).
+- **Hook shapes against the docs** ([hooks](https://cursor.com/docs/agent/hooks), [plugins](https://cursor.com/docs/reference/plugins)): input `conversation_id` and `transcript_path`; `beforeSubmitPrompt` answers `continue`/`user_message`; `postToolUse` takes `additional_context`; `preCompact` is observational only and there is no post-compaction event, so the notes go in on the next `postToolUse`; `subagentStop` sends `agent_transcript_path`; the manifest's `hooks` field points at `hooks/cursor.json`. All match the script.
+- Not settled by the docs: whether the Cursor CLI runs plugin hooks at all (they only say so for `workspaceOpen`).
+
 ## Claude Code V3 and V4, 2026-10-25
 
 Claude Code 2.1.307, session model and observer model `haiku`, `observe_after_tokens` set to 300 in `config.json`. One session, run as `claude -p --plugin-dir <repo> --output-format json`, then `--resume <id>` four more times.

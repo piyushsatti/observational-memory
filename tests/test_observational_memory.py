@@ -668,6 +668,15 @@ class TestRendering(OmCase):
         self.assertEqual(json.loads(mem.CHILD_ENV["opencode"]["OPENCODE_CONFIG_CONTENT"]), {"permission": {"*": "deny"}})
 
 
+class TestCursorInjected(OmCase):
+    def test_cursor_own_text_in_user_messages_is_skipped(self):
+        cfg = mem.load_config()
+        for text in (*mem.CURSOR_INJECTED, "<user_query>\nhi\n</user_query>"):
+            obj = {"role": "user", "message": {"content": [{"type": "text", "text": text + " ..."}]}}
+            parsed = mem.parse_cursor(obj, 1, cfg, True)
+            self.assertEqual(parsed is None, text in mem.CURSOR_INJECTED)
+
+
 # ---------------------------------------------------------------- OpenCode: the plugin's payloads
 
 
